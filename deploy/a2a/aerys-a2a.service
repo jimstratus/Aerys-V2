@@ -1,0 +1,33 @@
+[Unit]
+Description=Aerys isolated A2A peer transport
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/aerys/a2a.json
+ConditionPathExists=/etc/aerys/a2a.env
+
+[Service]
+Type=simple
+User=aerys-a2a
+Group=aerys-a2a
+WorkingDirectory=/opt/aerys/current
+EnvironmentFile=/etc/aerys/a2a.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/aerys-a2a
+ExecStartPre=/opt/aerys/current/.venv/bin/aerys-v2-a2a --config /etc/aerys/a2a.json --check
+ExecStart=/opt/aerys/current/.venv/bin/aerys-v2-a2a --config /etc/aerys/a2a.json
+StateDirectory=aerys-a2a
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=120s
+KillMode=control-group
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aerys-a2a
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

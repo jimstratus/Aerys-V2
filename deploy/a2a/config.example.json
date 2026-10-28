@@ -1,0 +1,26 @@
+{
+  "public_url": "https://aerys.example.invalid/",
+  "tenant": "aerys",
+  "host": "0.0.0.0",
+  "port": 9901,
+  "receipt_path": "/var/lib/aerys-a2a/receipts.sqlite3",
+  "model": "SET_TO_APPROVED_MODEL",
+  "model_base_url": "https://api.openai.com/v1",
+  "model_key_env": "AERYS_PEER_MODEL_KEY",
+  "capacity": 8,
+  "max_body": 65536,
+  "peers": [
+    {
+      "id": "example-peer",
+      "url": "https://peer.example.invalid/profile/",
+      "tenant": "profile",
+      "card_name": "Exact verified Agent Card name",
+      "token_env": "EXAMPLE_PEER_INBOUND_TOKEN",
+      "outbound_token_env": "EXAMPLE_PEER_OUTBOUND_TOKEN",
+      "state": "active",
+      "grants": ["send", "get", "list", "cancel"],
+      "capabilities": ["text"],
+      "timeout": 30
+    }
+  ]
+}

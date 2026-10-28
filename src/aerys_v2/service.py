@@ -389,17 +389,18 @@ def _face(
         log.debug("face push seam failed (harmless)", exc_info=True)
 
 
-def _turn_span(thread_id: str, text: str):
-    """One span per ask() turn — every model call underneath parents into it."""
+def _turn_span(thread_id: str, text: str, *, capture_payloads: bool = True):
+    """One span per ask(); peer callers can omit payloads and raw exceptions."""
     if _TRACER is None:
         return contextlib.nullcontext()
+    attributes = {"openinference.span.kind": "CHAIN", "thread_id": thread_id}
+    if capture_payloads:
+        attributes["input.value"] = text
     return _TRACER.start_as_current_span(
         "ask",
-        attributes={
-            "openinference.span.kind": "CHAIN",
-            "input.value": text,
-            "thread_id": thread_id,
-        },
+        attributes=attributes,
+        record_exception=capture_payloads,
+        set_status_on_exception=capture_payloads,
     )
 
 
@@ -1133,6 +1134,7 @@ def ask(
     drop_unaddressed: bool = False,
     drop_conversation_window_s: float = 180.0,
     activity_registry: dict[str, float] | None = None,
+    trace_payloads: bool = True,
 ) -> str:
     """Run one conversational turn and return the reply text.
 
@@ -1173,6 +1175,8 @@ def ask(
     - guest_action_graph: the reduced action graph (media tools only) used for
       non-allowlisted callers, from factory.guest_action_graph_for. None = they get
       no tools at all (chat-only), preserving the pre-media-split behavior.
+    - trace_payloads: False omits prompt/raw exception span data for restricted
+      machine callers; True preserves the existing owner tracing behavior.
     - record_turn: the v2_turns audit seam (factory.turn_recorder_for). Called
       once per completed turn on EVERY path with the fully-built row, off the hot
       path and fail-open (see _fire_turn_record). None = no auditing (dev/CI, no
@@ -1240,7 +1244,7 @@ def ask(
         "recursion_limit": rails.turn_limit,
     }
 
-    with _turn_span(str(thread_id), text):
+    with _turn_span(str(thread_id), text, capture_payloads=trace_payloads):
         # Phase 2 plumbing: tell a live decider which surface this is, and clear
         # any record left by an earlier turn on this context.
         REFLEX_SURFACE.set(_reflex_surface(identity, thread_id))

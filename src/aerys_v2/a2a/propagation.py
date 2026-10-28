@@ -18,6 +18,12 @@ def carrier(headers):
     return result
 
 
+def inject():
+    result = {}
+    propagator.inject(result)
+    return carrier(result)
+
+
 def scrub(text, secrets):
     for secret in sorted((s for s in secrets if s), key=len, reverse=True):
         text = text.replace(secret, "[REDACTED]")

@@ -13,6 +13,7 @@ WorkingDirectory=/opt/aerys/current
 EnvironmentFile=/etc/aerys/a2a.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/aerys-a2a
+Environment=OTEL_INSTRUMENTATION_A2A_SDK_ENABLED=false
 ExecStartPre=/opt/aerys/current/.venv/bin/aerys-v2-a2a --config /etc/aerys/a2a.json --check
 ExecStart=/opt/aerys/current/.venv/bin/aerys-v2-a2a --config /etc/aerys/a2a.json
 StateDirectory=aerys-a2a

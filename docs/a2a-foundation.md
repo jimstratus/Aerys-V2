@@ -115,10 +115,16 @@ Known peer/model credentials and common labeled credential values are scrubbed
 before model input, transport output and result persistence. Exceptions return
 fixed nonsecret messages. Prompts are not stored in receipts (digest only), and
 unknown remote metadata/history/nontext artifacts are not persisted. This is
-**bounded credential redaction, not general PII/DLP qualification**. No diagnostic
-payload collector/exporter is enabled by the standalone launcher. Do not enable
-raw LangChain/ask payload export without the separately reviewed source-redaction
-policy. Backend/export resource identity is the observability lane's responsibility.
+**bounded credential redaction, not general PII/DLP qualification**. No diagnostic payload collector/exporter is enabled by the standalone launcher.
+Peer calls explicitly opt out of `ask` payload/exception capture using the new
+`trace_payloads=False` argument (existing callers retain their previous defaults).
+Explicit peer spans disable automatic raw exception events/status descriptions.
+The standalone launcher/unit disable SDK automatic instrumentation **before SDK
+transport decorators load**, retaining only explicit correlation spans. Embedders
+must likewise set `OTEL_INSTRUMENTATION_A2A_SDK_ENABLED=false` before importing the
+SDK, or provide an independently reviewed exporter redaction policy; loading the
+SDK earlier bypasses that launcher-only guarantee. Do not enable raw LangChain
+payload export without the separately reviewed source-redaction policy. Backend/export resource identity is the observability lane's responsibility.
 
 ## Reproduce tests
 

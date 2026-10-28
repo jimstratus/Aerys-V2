@@ -29,6 +29,7 @@ class PeerAssistant:
             identity=identity,
             thread_id=request.thread_id,
             action_allowlist=frozenset(),
+            trace_payloads=False,
         )
 
     async def __call__(self, request):

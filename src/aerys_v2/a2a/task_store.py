@@ -231,12 +231,58 @@ class ReceiptStore:
         )
 
     def record_dispatch(self, dispatch_id, state, task=None):
-        self.db.execute(
-            "UPDATE dispatches SET state=?, remote_id=COALESCE(?, remote_id), task=COALESCE(?, task) WHERE id=?",
-            (
-                state,
-                task.id if task else None,
-                json.dumps(MessageToDict(task)) if task else None,
-                dispatch_id,
-            ),
-        )
+        # Pin receiver identity and preserve monotonic terminal evidence even when
+        # send and poll responses race across independent client processes.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.dispatch(dispatch_id)
+            if row is None:
+                raise KeyError(dispatch_id)
+            previous = (
+                ParseDict(json.loads(row["task"]), Task()) if row["task"] else None
+            )
+            if task:
+                if task.context_id != row["context"] or (
+                    row["remote_id"] and row["remote_id"] != task.id
+                ):
+                    raise ValueError("Original remote identity is immutable")
+                terminal = {
+                    TaskState.TASK_STATE_COMPLETED,
+                    TaskState.TASK_STATE_FAILED,
+                    TaskState.TASK_STATE_CANCELED,
+                    TaskState.TASK_STATE_REJECTED,
+                }
+                if previous and previous.status.state in terminal:
+                    if (
+                        task.status.state in terminal
+                        and task.status.state != previous.status.state
+                    ):
+                        raise ValueError(
+                            "Conflicting terminal evidence; reconciliation required"
+                        )
+                    if task.status.state not in terminal or previous.artifacts:
+                        self.db.execute("COMMIT")
+                        return previous
+                if previous and (
+                    previous.status.timestamp.seconds,
+                    previous.status.timestamp.nanos,
+                ) > (task.status.timestamp.seconds, task.status.timestamp.nanos):
+                    self.db.execute("COMMIT")
+                    return previous
+            elif row["remote_id"]:
+                self.db.execute("COMMIT")
+                return previous
+            self.db.execute(
+                "UPDATE dispatches SET state=?, remote_id=COALESCE(?, remote_id), task=COALESCE(?, task) WHERE id=?",
+                (
+                    state,
+                    task.id if task else None,
+                    json.dumps(MessageToDict(task)) if task else None,
+                    dispatch_id,
+                ),
+            )
+            self.db.execute("COMMIT")
+            return task
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise

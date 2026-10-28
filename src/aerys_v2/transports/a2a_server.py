@@ -155,7 +155,10 @@ class PeerHandler(RequestHandler):
         self.store.save(task)
         try:
             with tracer.start_as_current_span(
-                "a2a.execute", context=propagator.extract(trace)
+                "a2a.execute",
+                context=propagator.extract(trace),
+                record_exception=False,
+                set_status_on_exception=False,
             ) as span:
                 span.set_attribute("eotir.a2a.task.id", task.id)
                 span.set_attribute("eotir.agent.id", "aerys")

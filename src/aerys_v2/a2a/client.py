@@ -23,7 +23,7 @@ from a2a.types import (
 )
 
 from aerys_v2.a2a.contracts import ReconciliationRequired
-from aerys_v2.a2a.propagation import propagator, scrub, tracer
+from aerys_v2.a2a.propagation import inject, propagator, scrub, tracer
 
 
 class PeerClient:
@@ -37,7 +37,7 @@ class PeerClient:
             "Authorization": "Bearer " + self.registry.token(peer.id),
             "A2A-Version": "1.0",
         }
-        propagator.inject(headers)
+        headers.update(inject())
         return ClientCallContext(service_parameters=headers, timeout=peer.timeout)
 
     async def _transport(self, peer_id, operation):
@@ -83,13 +83,10 @@ class PeerClient:
                     clean.status.message.parts.add(
                         text=scrub(part.text, self.registry.redactions())
                     )
-        self.store.record_dispatch(dispatch_id, "accepted", clean)
-        return clean
+        return self.store.record_dispatch(dispatch_id, "accepted", clean)
 
     async def submit(self, peer_id, text, *, dispatch_id):
-        trace = {}
-        propagator.inject(trace)
-        row, fresh = self.store.prepare_dispatch(dispatch_id, peer_id, text, trace)
+        row, fresh = self.store.prepare_dispatch(dispatch_id, peer_id, text, inject())
         if not fresh and row["state"] != "prepared":
             return await self.reconcile(dispatch_id)
         peer, transport = await self._transport(peer_id, "send")
@@ -106,7 +103,9 @@ class PeerClient:
         if not self.store.claim_dispatch(dispatch_id):
             return await self.reconcile(dispatch_id)
         try:
-            with tracer.start_as_current_span("a2a.send"):
+            with tracer.start_as_current_span(
+                "a2a.send", record_exception=False, set_status_on_exception=False
+            ):
                 response = await transport.send_message(
                     request, context=self._context(peer)
                 )
@@ -124,7 +123,10 @@ class PeerClient:
         if not row:
             raise KeyError(dispatch_id)
         with tracer.start_as_current_span(
-            "a2a.reconcile", context=propagator.extract(json.loads(row["trace"]))
+            "a2a.reconcile",
+            context=propagator.extract(json.loads(row["trace"])),
+            record_exception=False,
+            set_status_on_exception=False,
         ):
             return await self._reconcile(row)
 

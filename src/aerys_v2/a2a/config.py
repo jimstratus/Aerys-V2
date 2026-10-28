@@ -98,6 +98,10 @@ def main():
                 raise ValueError("peer model credential missing")
             print("Peer configuration valid; no listener or model invocation started.")
             return
+        # SDK automatic exception events are not a payload privacy boundary.
+        # Disable them before importing server/client decorators in this process;
+        # our explicit correlation-only spans remain available.
+        os.environ["OTEL_INSTRUMENTATION_A2A_SDK_ENABLED"] = "false"
         import uvicorn
 
         uvicorn.run(

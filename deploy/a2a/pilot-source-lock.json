@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "deployment_authorized": false,
+  "aerys": {
+    "repository": "jimstratus/Aerys-V2",
+    "runtime_source_commit": "42e7abb5643af9a1152fa541c9147a974249d3b9",
+    "wheel": "aerys_v2-0.1.0-py3-none-any.whl",
+    "wheel_sha256": "e5da2c97c7186c0575bd3d8e9062a33c1c79f945ac5bad2e37dda97bf41e1a37",
+    "requirements_sha256": "8986308962fe6c4032c704e9098df755a72a9ac2d09c4f4a8b39ad77952afd5e",
+    "artifact_owner_task": "t_c776ba93"
+  },
+  "observability": {
+    "repository": "eotir/agents-infra",
+    "source_commit": "f09e99bbea926258e3d571fa1a4cb51577f4519c",
+    "artifact_owner_task": "t_098361d5"
+  },
+  "ledger": {
+    "authority": "owning native runtime",
+    "remote_mutations_enabled": false,
+    "receipt_backend": "private local SQLite, schema user_version 1",
+    "postgres_is_native_ledger": false
+  },
+  "portability_evidence_task": "t_05a9039a",
+  "production_postgres_receipt_task": "t_565ee1bb"
+}

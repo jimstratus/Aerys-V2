@@ -3463,8 +3463,18 @@ def build_graph(
     action_context_messages: int = 40,
     voice_action_context_messages: int = 12,
     guest_overlay_fn=None,
+    *,
+    durable_memory: bool = True,
+    inline_images: bool = True,
 ) -> object:
     """START → chat → END, checkpointed.
+
+    durable_memory / inline_images exist for the restricted A2A peer adapter, which
+    builds a fresh graph per task: its thread does NOT persist, so the "your memory
+    is durable" capability line would be a lie; and its input is text-only, so the
+    Discord-image fetch/inline step (a network download triggered by untrusted
+    peer text) must not run. Both default True: every existing caller's prompt and
+    behavior is unchanged byte for byte.
 
     The checkpointer is INJECTED (pluggable — cross-review #9): InMemorySaver for tests
     and the CLI today, PostgresSaver on the NAS when Phase 2 wires durability. The graph
@@ -3543,15 +3553,28 @@ def build_graph(
         # (see router.HANDOFF_MARKER for the full doctrine). The chat model is the
         # only component that sees full history, so IT catches the follow-up-shaped
         # misroutes ("yes, go ahead") the current-message-only router can't.
-        capability = (
+        memory_line = (
             "Your conversation memory is durable: this thread persists across "
             "restarts and sessions. You may confidently say you'll remember."
-            " In this conversational mode you have NO tools: no device control or "
+            if durable_memory else
+            "This exchange is stateless: nothing here is remembered after it ends, "
+            "so never promise to remember or follow up."
+        )
+        image_line = (
+            " (An IMAGE he attaches is "
+            "different: it comes with his message and you see it yourself, so "
+            "answer it yourself.)"
+            if inline_images else
+            " You cannot see images; if text refers to one, say so."
+        )
+        capability = (
+            memory_line
+            + " In this conversational mode you have NO tools: no device control or "
             "device-state reads, no email, no sending or passing on messages, "
             "no live web/weather/news lookup, no way "
-            "to open files, documents, videos or links. (An IMAGE he attaches is "
-            "different: it comes with his message and you see it yourself, so "
-            "answer it yourself.) You cannot turn anything on or off and you cannot read "
+            "to open files, documents, videos or links."
+            + image_line
+            + " You cannot turn anything on or off and you cannot read "
             "any device's current state — NEVER say you did, and never state a "
             "device result you did not get from a tool. "
             # Aerys-V2 #1 (Chris approved 2026-10-10): the measured slip was an invented
@@ -3709,9 +3732,10 @@ def build_graph(
         # Her own eyes (2026-09-28): the current turn's Discord images are fetched and
         # inlined for THIS call, so the model answering him is the one looking. The
         # stored message keeps its URL; nothing else about the prompt changes.
-        from aerys_v2.images import inline_current_images
+        if inline_images:
+            from aerys_v2.images import inline_current_images
 
-        prompt = inline_current_images(prompt)
+            prompt = inline_current_images(prompt)
         # Tier -> model, resolved per turn (normalize_tier at the node too, not
         # just ask() — belt-and-braces: whatever garbage reaches config,
         # the node answers with a REAL model and the trace shows which).

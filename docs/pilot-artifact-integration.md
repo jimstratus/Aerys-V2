@@ -9,6 +9,19 @@ source lock is modified. The build stages the original reviewed wheel, not a
 replacement wheel from this integration branch. The service/config remain inert
 examples; neither is installed or enabled.
 
+## Status after review fixes (2026-11-22)
+
+PR #1 was updated after this pin was taken: master (269 upstream commits) was
+merged in, and the review findings were fixed in `executor.py`, `factory.py` and
+`a2a/task_store.py`. The current checkout therefore no longer matches the
+`42e7abb` wheel, and `build_pilot.py` **refuses to stage it by design** (module
+mismatch). The inventory check now also compares the checkout's full module
+inventory with the wheel, so an extra module can't slip through either. To stage
+a pilot from current source, cut a new wheel, requirements lock and runtime
+manifest from the merged commit, have them reviewed, and update `SOURCE`,
+`MANIFEST_SHA256` and `pilot-source-lock.json` together. Do not edit the pins to
+match without new reviewed artifacts.
+
 ## Imported original artifacts
 
 Every artifact below belongs to t_c776ba93 and the runtime source revision above.

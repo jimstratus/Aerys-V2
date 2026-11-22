@@ -21,6 +21,28 @@ def git(root: Path, *args: str) -> bytes:
     return subprocess.check_output(["git", "-C", str(root), *args])
 
 
+def checkout_modules(root: Path) -> list[str]:
+    """Every Python module present in the working checkout, tracked or not."""
+    src = root / "src"
+    return sorted(str(p.relative_to(src)) for p in (src / "aerys_v2").rglob("*.py")
+                  if "__pycache__" not in p.parts)
+
+
+def check_module_inventory(wheel: list[str], pinned: list[str], checkout: list[str]) -> None:
+    """The wheel, the pinned tree and the checkout must hold the SAME modules.
+
+    Comparing only wheel vs pinned tree (the original check) lets an extra module
+    in the checkout through, staging an older wheel against newer source; the
+    integration doc requires inventories to match, not just intersect.
+    """
+    if sorted(wheel) != sorted(pinned):
+        raise ValueError("wheel/source module inventory mismatch")
+    if sorted(checkout) != sorted(wheel):
+        extra = sorted(set(checkout) - set(wheel))
+        missing = sorted(set(wheel) - set(checkout))
+        raise ValueError(f"wheel/checkout module inventory mismatch: extra={extra} missing={missing}")
+
+
 def build(root: Path, inputs: Path, output: Path) -> dict:
     """Validate everything before creating a new, nonexisting output directory."""
     lock = json.loads((root / "deploy/a2a/pilot-source-lock.json").read_text())
@@ -61,8 +83,7 @@ def build(root: Path, inputs: Path, output: Path) -> dict:
         names = sorted(n for n in wheel.namelist() if n.startswith("aerys_v2/") and n.endswith(".py"))
         tracked = git(root, "ls-tree", "-r", "--name-only", SOURCE, "src/aerys_v2").decode().splitlines()
         expected_names = sorted(n.removeprefix("src/") for n in tracked if n.endswith(".py"))
-        if names != expected_names:
-            raise ValueError("wheel/source module inventory mismatch")
+        check_module_inventory(names, expected_names, checkout_modules(root))
         for name in names:
             data = wheel.read(name)
             if data != git(root, "show", f"{SOURCE}:src/{name}") or data != (root / "src" / name).read_bytes():

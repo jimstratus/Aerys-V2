@@ -64,3 +64,22 @@ def test_existing_output_is_never_overwritten(tmp_path, original_inputs, builder
         builder.build(ROOT, original_inputs, output)
     assert list(output.iterdir()) == [sentinel]
     assert sentinel.read_bytes() == b"existing"
+
+
+def test_inventory_check_refuses_extra_checkout_module(builder):
+    # Review finding on PR #2: an extra module in the checkout must refuse
+    # staging even when the wheel matches the pinned tree.
+    pinned = ["aerys_v2/__init__.py", "aerys_v2/a.py"]
+    builder.check_module_inventory(list(pinned), list(pinned), list(pinned))
+    with pytest.raises(ValueError, match="wheel/checkout module inventory mismatch: extra=\\['aerys_v2/new.py'\\]"):
+        builder.check_module_inventory(pinned, pinned, pinned + ["aerys_v2/new.py"])
+    with pytest.raises(ValueError, match="missing=\\['aerys_v2/a.py'\\]"):
+        builder.check_module_inventory(pinned, pinned, ["aerys_v2/__init__.py"])
+    with pytest.raises(ValueError, match="wheel/source module inventory mismatch"):
+        builder.check_module_inventory(pinned, pinned[:1], pinned)
+
+
+def test_checkout_modules_lists_real_tree_without_pycache(builder):
+    modules = builder.checkout_modules(ROOT)
+    assert "aerys_v2/a2a/executor.py" in modules
+    assert not any("__pycache__" in m for m in modules)

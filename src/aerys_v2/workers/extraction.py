@@ -90,6 +90,8 @@ from difflib import SequenceMatcher
 from typing import Any, Callable, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 
+from ..services.location_guard import address_shaped, location_shaped
+from ..test_bodies import DEFAULT_PATTERNS as DEFAULT_TEST_BODY_PATTERNS
 from ..services.memory import Embedder, embedding_to_pgvector
 
 log = logging.getLogger(__name__)
@@ -163,6 +165,10 @@ EXTRACTION_SYSTEM_PROMPT = """You extract memories from conversation transcripts
 - Questions, requests for information, and observations derived only from questions (never infer an answer)
 - Greetings and smalltalk: "hey", "what's up", "how are you"
 
+## Current location privacy (overrides all other extraction rules):
+- Never save Chris's current location, whereabouts, address or coordinates, whether from the presence block, the nearby tool, or anything he says about where he is right now.
+- A trip may be saved only as a dated fact that includes its end date, e.g. "Chris is at a conference in Springfield, Nov 1-6, 2026". Without an end date, do not save the trip.
+
 ## Test-only observations (SKIP):
 - Testing, probing, or evaluating the assistant/system or its memory is not a memory about the person.
 - Reject observations whose only content is testing activity, even if phrased as an interest, decision, emotion, technical task, or preference: "Engaged in testing AI memory capabilities", "Conducting UAT with the assistant", "Completed memory testing phase", "Likes to test memory recall with specific items".
@@ -201,7 +207,7 @@ EXTRACTION_SYSTEM_PROMPT = """You extract memories from conversation transcripts
 ## privacy_level rules:
 - "public": name, job, location, hobbies, vehicle, interests, general life facts
 - "private": health details, financial specifics, relationship struggles, personal traumas, sexual orientation
-- Source channel (DM vs public) is context, not a rule
+- A private conversation stays private whatever you answer here; this field can only make a public-channel fact private
 
 If nothing worth remembering, return []."""
 
@@ -298,6 +304,14 @@ FROM v2_turns t
 WHERE t.person_id IS NOT NULL
   AND t.guard_verdict IS DISTINCT FROM 'portable_untrusted'
   AND t.channel IS DISTINCT FROM 'sentinel'
+  -- Fail closed on every nearby call, including refusals/unknown outcomes.
+  -- The audit stores tool names but not location payloads; no schema change needed.
+  AND NOT COALESCE(t.tool_calls, '[]'::jsonb) @> '[{"name":"where_is_chris_nearby"}]'::jsonb
+  -- D2 (Chris 2026-11-08): a voice turn that stayed the owner's only by default
+  -- (untagged, or the recognizer unsure) never becomes his memory.
+  AND NOT COALESCE(t.degraded, '[]'::jsonb) @> '["voice_owner_assumed"]'::jsonb
+  -- A test body's turns (Kael's gate body, home test jobs) were never his words (11/09).
+  AND NOT (COALESCE(t.channel_id::text, '') LIKE ANY(%(test_bodies)s::text[]))
   AND t.input_text != ''
   AND t.created_at > %(after)s::timestamptz
 ORDER BY t.created_at ASC
@@ -648,6 +662,8 @@ def triage_memory(
         "key_label: " row in its place. An observation that says nothing
         must never be allowed to overwrite one that does.
     """
+    if any(location_shaped(v) or address_shaped(v) for v in (key_label, value_text, content, context, source_text, event_date)):
+        return "skipped"
     if key_label is None or not key_label.strip():
         return "skipped"
     if not value_text.strip():
@@ -798,10 +814,18 @@ def seal_rows(rows: list[dict], sealed_rooms: frozenset[str]) -> list[dict]:
 
 def observation_privacy(obs: dict, group: dict) -> str:
     """The privacy a memory lands with. The model may tighten a group's level, never
-    loosen a sealed one."""
+    loosen it.
+
+    #173 (2026-11-07): this used to return the model's level whenever it gave one, so
+    a plain-mode reply marking a DM's birthday, home town and spouse "public" would
+    have landed them guild-visible. The schema path never carried the field, which
+    hid it until a backfill note truncated into the plain retry. Private wins.
+    """
     if group.get("sealed"):
         return PRIVATE_LEVEL
-    return obs.get("privacy_level") or group["privacy_level"]
+    if PRIVATE_LEVEL in (obs.get("privacy_level"), group["privacy_level"]):
+        return PRIVATE_LEVEL
+    return group["privacy_level"]
 
 
 def group_by_person(rows: list[dict], *, batch_size: int = BATCH_SIZE) -> list[dict]:
@@ -819,11 +843,14 @@ def group_by_person(rows: list[dict], *, batch_size: int = BATCH_SIZE) -> list[d
         group_key = (
             (str(pid), row.get("source_thread")) if row.get("source_platform") == "portable"
             else (str(pid), None)
-        ) + (bool(row.get("sealed")),)  # a sealed room's turns never share a call
+        ) + (bool(row.get("sealed")),  # a sealed room's turns never share a call
+             # #173: nor do private and public ones. The group's level is its first
+             # row's, so a guild turn first would have carried a DM's facts public.
+             row.get("privacy_level") == PRIVATE_LEVEL)
         by_person.setdefault(group_key, []).append(row)
 
     groups = []
-    for (pid, _thread, sealed), msgs in by_person.items():
+    for (pid, _thread, sealed, _private), msgs in by_person.items():
         for i in range(0, len(msgs), batch_size):
             batch = msgs[i : i + batch_size]
             # latest message in the batch: memory created_at + batch-date fallback
@@ -899,6 +926,10 @@ def parse_observations(text: str) -> list[dict] | None:
     result = []
     for obs in observations:
         if not isinstance(obs, dict):
+            continue
+        # Inspect decoded fields so escaped newlines cannot bypass the guard.
+        if any(location_shaped(v) or address_shaped(v) for v in obs.values() if isinstance(v, str)):
+            log.warning("memory skipped: location-shaped observation")
             continue
         if any(question_shaped(obs.get(k)) for k in ("value_text", "source_text", "context")):
             log.warning("memory skipped: question-shaped observation")
@@ -1029,6 +1060,18 @@ def _extract_group(llm: Llm, group: dict, stats: dict) -> tuple[list[dict] | Non
         log.warning("memory skipped: question-shaped or test-shaped source message")
     if not messages:
         return [], LlmReply("[]", False)
+    return _extract_messages(llm, messages, stats)
+
+
+def _extract_messages(llm: Llm, messages: list[dict], stats: dict) -> tuple[list[dict] | None, LlmReply]:
+    """_extract_group's body for one run of messages; it calls itself on halves.
+
+    #173 (2026-11-07): one dense 2.2 kB turn (~26 facts) truncated under the schema
+    AND plain, and the held watermark would have pulled every later turn of his into
+    the same ever-growing group. A group still cut off after the plain retry is now
+    split in half and each half extracted on its own, recursively. Only a SINGLE
+    message that still truncates holds the watermark, and the stall alarm sees it.
+    """
     prompt = (
         "Extract observations from this conversation:\n\n"
         f"{build_transcript(messages)}"
@@ -1052,6 +1095,18 @@ def _extract_group(llm: Llm, group: dict, stats: dict) -> tuple[list[dict] | Non
                     len(messages))
         reply = _call_llm(llm, EXTRACTION_SYSTEM_PROMPT, prompt, plain=True)
         observations = parse_observations(reply.text)
+        if observations is None and reply.truncated and len(messages) > 1:
+            stats["splits"] = stats.get("splits", 0) + 1
+            mid = len(messages) // 2
+            log.warning("extraction still truncated plain — splitting the group (%d -> %d + %d)",
+                        len(messages), mid, len(messages) - mid)
+            first, reply = _extract_messages(llm, messages[:mid], stats)
+            if first is None:
+                return None, reply
+            second, reply = _extract_messages(llm, messages[mid:], stats)
+            if second is None:
+                return None, reply
+            return first + second, reply
         if observations is not None or reply.truncated:
             return observations, reply
 
@@ -1074,6 +1129,7 @@ def run_extraction(
     lookback_hours: int = DEFAULT_LOOKBACK_H,
     batch_limit: int = DEFAULT_LIMIT,
     sealed_rooms: frozenset[str] = frozenset(),
+    test_bodies: Sequence[str] = DEFAULT_TEST_BODY_PATTERNS,
 ) -> dict:
     """One shadow extraction pass over both conversation sources.
 
@@ -1104,7 +1160,7 @@ def run_extraction(
 
     for name, conn, sql in sources:
         after = read_watermark(staging_conn, name, lookback_hours=lookback_hours)
-        raw_rows = conn.execute(sql, {"after": after, "limit": batch_limit + 1}).fetchall()
+        raw_rows = conn.execute(sql, {"after": after, "limit": batch_limit + 1, "test_bodies": list(test_bodies)}).fetchall()
         rows = seal_rows([dict(zip(SOURCE_COLUMNS, r)) for r in raw_rows], sealed_rooms)
         rows = _trim_tie_boundary(rows, batch_limit)
 
@@ -1115,7 +1171,7 @@ def run_extraction(
             # earned one corrective retry. format_empty: those that ignored it
             # twice and were taken at their word as "nothing here" (the watermark
             # moves). parse_failures now means TRUNCATION — the watermark is stuck.
-            "format_retries": 0, "format_empty": 0, "schema_fallbacks": 0,
+            "format_retries": 0, "format_empty": 0, "schema_fallbacks": 0, "splits": 0,
         }
         summary["sources"][name] = stats
         if not rows:
@@ -1205,6 +1261,7 @@ def run_live_extraction(
     lookback_hours: int = DEFAULT_LOOKBACK_H,
     batch_limit: int = DEFAULT_LIMIT,
     sealed_rooms: frozenset[str] = frozenset(),
+    test_bodies: Sequence[str] = DEFAULT_TEST_BODY_PATTERNS,
 ) -> dict:
     """The live counterpart of run_extraction(): same read -> group -> LLM ->
     embed pipeline, same watermark table (both modes share the high-water
@@ -1265,7 +1322,7 @@ def run_live_extraction(
 
     for name, conn, sql in sources:
         after = read_watermark(staging_conn, name, lookback_hours=lookback_hours)
-        raw_rows = conn.execute(sql, {"after": after, "limit": batch_limit + 1}).fetchall()
+        raw_rows = conn.execute(sql, {"after": after, "limit": batch_limit + 1, "test_bodies": list(test_bodies)}).fetchall()
         rows = seal_rows([dict(zip(SOURCE_COLUMNS, r)) for r in raw_rows], sealed_rooms)
         rows = _trim_tie_boundary(rows, batch_limit)
 
@@ -1278,7 +1335,7 @@ def run_live_extraction(
             # earned one corrective retry. format_empty: those that ignored it
             # twice and were taken at their word as "nothing here" (the watermark
             # moves). parse_failures now means TRUNCATION — the watermark is stuck.
-            "format_retries": 0, "format_empty": 0, "schema_fallbacks": 0,
+            "format_retries": 0, "format_empty": 0, "schema_fallbacks": 0, "splits": 0,
         }
         summary["sources"][name] = stats
         if not rows:
@@ -1370,8 +1427,12 @@ _RESPONSE_FORMAT = {
                             "context": {"type": "string"},
                             "source_text": {"type": "string"},
                             "event_date": {"type": "string"},
+                            # #173: lets the model TIGHTEN a public-channel fact
+                            # (observation_privacy never lets it loosen).
+                            "privacy_level": {"type": "string", "enum": ["public", "private"]},
                         },
-                        "required": ["key_label", "value_text", "context", "source_text", "event_date"],
+                        "required": ["key_label", "value_text", "context", "source_text", "event_date",
+                                     "privacy_level"],
                         "additionalProperties": False,
                     },
                 }
@@ -1385,7 +1446,10 @@ _RESPONSE_FORMAT = {
 #: Raised from v1's 1200 now that truncation is DETECTABLE rather than silently
 #: indistinguishable from a refusal (see LlmReply). A schema-constrained reply is
 #: denser than prose, so this is headroom for a genuinely busy group, not slack.
-MAX_OUTPUT_TOKENS = 4000
+#: #173 (2026-11-07): 4000 -> 16000. Haiku 5.5's thinking counts against this budget,
+#: and a single dense 2.2 kB note needed ~3.6k (thinking + ~26 observations), so 4000
+#: truncated an honest turn. Only the tokens actually used are billed.
+MAX_OUTPUT_TOKENS = 16000
 
 
 def openrouter_chat(api_key: str, *, model: str = LLM_MODEL,

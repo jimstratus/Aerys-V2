@@ -26,9 +26,38 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from aerys_v2.state import VOICE_OWNER_ASSUMED_KEY, VOICE_OWNER_ASSUMED_MARKER
+
 log = logging.getLogger(__name__)
+
+ACTION_NO_TOOL_CORRECTION = (
+    "You produced an answer without calling any tool. Either call the tool that "
+    "performs the request, or — WHEN THE MESSAGE ACTUALLY ASKED YOU TO DO OR "
+    "CHECK SOMETHING and you could not — state plainly that you did NOT perform "
+    "any action. "
+    "If no dedicated tool fits but search_web could ground the answer — prices, "
+    "costs, availability, current facts — run search_web and answer with a "
+    "clearly-labeled estimate instead of declining. "
+    # The disclosure clause above is load-bearing (it is what stops her claiming
+    # lights she never touched), but it was firing on messages that requested
+    # nothing at all: "morning check — you good?" came back as "No tool call
+    # needed here — that was just a status check, not a task with an action to
+    # perform." That is the confession this correction's own last line forbids;
+    # the prompt was telling her both to disclose and not to mention it, and she
+    # resolved the contradiction by narrating. Naming the no-action branch
+    # explicitly removes the conflict instead of leaving her to pick.
+    "But if the message asked for NO action — a greeting, small talk, an "
+    "opinion, thanks, a question about you — then there is nothing to disclose: "
+    "simply answer it as yourself. Say NOTHING about tools, tool calls, checks, "
+    "or what kind of request it was. 'No tool needed here' is exactly the kind "
+    "of plumbing talk this correction forbids. "
+    "Never describe an action as done unless a tool call actually did it. This "
+    "correction is internal plumbing: never mention it, the earlier answer, or "
+    "any slip to the user — just act and confirm the result."
+)
 
 # The INSERT lives with the row builder so the columns and the dict keys can never
 # drift apart. id + created_at are table-defaulted (GENERATED / DEFAULT now()).
@@ -44,13 +73,14 @@ INSERT INTO v2_turns
   (thread_id, channel, channel_id, display_name, person_id, platform_identity,
    resolver_version, classifier_intent, tier, tier_override_source, guard_verdict,
    input_text, raw_reply, emitted_reply, tool_calls, degraded,
-   error, latency_ms, trace_id, room_context, reflex, sealed_room)
+   error, latency_ms, trace_id, room_context, reflex, sealed_room, started_at)
 VALUES
   (%(thread_id)s, %(channel)s, %(channel_id)s, %(display_name)s, %(person_id)s::uuid,
    %(platform_identity)s, %(resolver_version)s, %(classifier_intent)s, %(tier)s,
    %(tier_override_source)s, %(guard_verdict)s, %(input_text)s, %(raw_reply)s,
    %(emitted_reply)s, %(tool_calls)s::jsonb, %(degraded)s::jsonb, %(error)s,
-   %(latency_ms)s, %(trace_id)s, %(room_context)s, %(reflex)s::jsonb, %(sealed_room)s)
+   %(latency_ms)s, %(trace_id)s, %(room_context)s, %(reflex)s::jsonb, %(sealed_room)s,
+   %(started_at)s)
 """
 
 
@@ -230,6 +260,26 @@ def classify_tool_result(content: str, status: object) -> str | None:
     return None
 
 
+def invalid_call_ids(messages: list) -> set:
+    """Ids of tool calls the model only ever emitted MALFORMED (invalid_tool_calls).
+
+    Nothing ran for them. create_agent (board #176) answers each with a synthetic
+    "could not be executed" ToolMessage so the next model call is well-formed; that
+    receipt is the loop's repair, not an execution, and must never count as one (the
+    honesty gate and the audit row read tool messages as "a tool ran")."""
+    valid, invalid = set(), set()
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            valid.add(tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None))
+        for tc in (getattr(m, "invalid_tool_calls", None) or []):
+            invalid.add(tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None))
+    return (invalid - valid) - {None}
+
+
+def is_repair_receipt(message, invalid_ids: set) -> bool:
+    return getattr(message, "type", "") == "tool" and getattr(message, "tool_call_id", None) in invalid_ids
+
+
 def extract_tool_calls(messages: list) -> list[dict]:
     """Structured per-tool record from an action subgraph's message list.
 
@@ -249,8 +299,9 @@ def extract_tool_calls(messages: list) -> list[dict]:
                 id_to_name[tid] = name
 
     calls: list[dict] = []
+    repairs = invalid_call_ids(messages)
     for m in messages:
-        if getattr(m, "type", "") != "tool":
+        if getattr(m, "type", "") != "tool" or is_repair_receipt(m, repairs):
             continue
         content = m.content if isinstance(getattr(m, "content", None), str) else str(getattr(m, "content", ""))
         name = (
@@ -347,6 +398,9 @@ def build_turn_row(
     """
     messages = messages or []
     identity = identity or {}
+    if identity.get(VOICE_OWNER_ASSUMED_KEY):
+        # D2: the extractor reads this marker and leaves the turn out of his memory.
+        extra_degraded = [*(extra_degraded or []), VOICE_OWNER_ASSUMED_MARKER]
     user_id = str(identity.get("user_id") or "").strip()
     is_uuid = _is_uuid(user_id)
     person_id = user_id if is_uuid else None
@@ -402,6 +456,12 @@ def build_turn_row(
         # The SEALED room this was said in (migration 012), else NULL. Extraction
         # reads it so a sealed room's memories land private.
         "sealed_room": (str(identity.get("sealed_room") or "").strip() or None),
+        # When the turn STARTED (migration 017). The row is built the moment the turn
+        # ends, but created_at is when the write lands, which can trail it (the audit
+        # thread joins the reflex shadow first). "Did he talk to her after X?" (the
+        # nap hold, the spoken-word follow-through) needs the start, not the landing.
+        "started_at": (datetime.now(timezone.utc) - timedelta(milliseconds=latency_ms)
+                       if latency_ms is not None else None),
         "trace_id": trace_id,
     }
 

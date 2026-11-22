@@ -33,7 +33,7 @@ from aerys_v2.workers.extraction import (
 
 T0 = datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc)
 CHRIS = "6e6bcbed-03ef-4d17-95d2-89c467414335"
-MEGAN = "11111111-2222-3333-4444-555555555555"
+ROBIN = "11111111-2222-3333-4444-555555555555"
 
 
 def row(person_id, content, *, id="1", at=T0, raw=None, speaker="Unknown",
@@ -127,7 +127,7 @@ def test_groups_by_person_before_extraction():
     """Interleaved two-person chat -> two LLM calls, each seeing ONLY its person."""
     prod = FakeConn([("FROM n8n_chat_histories", [
         row(CHRIS, "I drive a Dodge Ram"),
-        row(MEGAN, "I collect SNES games"),
+        row(ROBIN, "I collect SNES games"),
         row(CHRIS, "and I live in Rotonda West"),
     ])])
     staging = FakeConn()
@@ -137,9 +137,9 @@ def test_groups_by_person_before_extraction():
     assert len(llm.calls) == 2
     transcripts = [user for _, user in llm.calls]
     chris_t = next(t for t in transcripts if "Dodge Ram" in t)
-    megan_t = next(t for t in transcripts if "SNES" in t)
+    robin_t = next(t for t in transcripts if "SNES" in t)
     assert "SNES" not in chris_t and "Rotonda West" in chris_t  # no cross-person bleed
-    assert "Dodge Ram" not in megan_t
+    assert "Dodge Ram" not in robin_t
     assert all(system == EXTRACTION_SYSTEM_PROMPT for system, _ in llm.calls)
 
 
@@ -265,7 +265,7 @@ def test_parse_failure_mid_batch_holds_watermark_but_stages_other_groups():
     PERSON_C = "99999999-8888-7777-6666-555555555555"
     prod = FakeConn([("FROM n8n_chat_histories", [
         row(CHRIS, "I drive a Dodge Ram", id="a", at=T0, raw=raw_a),
-        row(MEGAN, "I collect SNES games", id="b", at=T0 + timedelta(seconds=2), raw=raw_b),
+        row(ROBIN, "I collect SNES games", id="b", at=T0 + timedelta(seconds=2), raw=raw_b),
         row(PERSON_C, "mumble mumble", id="c", at=T0 + timedelta(seconds=5), raw=raw_c),
     ])])
     staging = FakeConn()
@@ -435,7 +435,7 @@ def test_limit_boundary_tie_is_trimmed_not_split():
     tie_at = T0 + timedelta(seconds=5)
     prod = FakeConn([("FROM n8n_chat_histories", [
         row(CHRIS, "first", id="1", at=T0, raw="2026-07-03 12:00:00.000000+00"),
-        row(MEGAN, "tied-a", id="2", at=tie_at, raw=tie_raw),
+        row(ROBIN, "tied-a", id="2", at=tie_at, raw=tie_raw),
         row(CHRIS, "tied-b", id="3", at=tie_at, raw=tie_raw),
     ])])
     staging = FakeConn()
@@ -1055,3 +1055,83 @@ def test_kael_desk_alarm_is_none_without_the_desk_settings():
     from aerys_v2.workers.__main__ import kael_desk_alarm_for
 
     assert kael_desk_alarm_for(Settings(_env_file=None, anthropic_api_key="x")) is None
+
+
+# --- #173: a dense turn can't jam the line, and private never goes public -----
+
+
+def test_a_group_still_truncated_plain_is_split_and_both_halves_land():
+    """#173 (2026-11-07): a dense group cut off under the schema AND plain used to
+    hold the watermark forever, pulling every later turn into the same group. It
+    now splits in half; each half extracts on its own and the watermark moves."""
+    raws = ["2026-07-03 12:00:00.000001+00", "2026-07-03 12:00:01.000001+00"]
+    prod = FakeConn([("FROM n8n_chat_histories", [
+        row(CHRIS, "I drive a Dodge Ram", id="a", at=T0, raw=raws[0]),
+        row(CHRIS, "and I live in Rotonda West", id="b", at=T0 + timedelta(seconds=1), raw=raws[1]),
+    ])])
+    staging = FakeConn([("last_processed_at", [("2026-07-03 11:00:00+00",)])])
+    llm = FakeLlm([cut_off('[{"key_label": "vehic'), cut_off('[{"key_label": "vehi'), OBS, OBS])
+    summary = run_extraction(prod, staging, llm, fake_embedder)
+
+    assert [c[2:] for c in llm.calls] == [(), ("plain",), (), ()]
+    halves = [c[1] for c in llm.calls[2:]]
+    assert "Dodge Ram" in halves[0] and "Rotonda" not in halves[0]
+    assert "Rotonda" in halves[1] and "Dodge Ram" not in halves[1]
+    stats = summary["sources"]["prod_chat"]
+    assert (stats["splits"], stats["parse_failures"], stats["observations"]) == (1, 0, 2)
+    save = next(p for s, p in staging.calls if "v2_extraction_watermark" in s and "INSERT" in s)
+    assert save["raw"] == raws[1], "advanced past the split group"
+
+
+def test_a_single_message_still_truncated_after_a_split_holds_the_watermark():
+    """The split never weakens the invariant: a half that is ONE message and is cut
+    off twice is still a possible lost observation, so the whole group holds."""
+    existing_wm = "2026-07-03 11:00:00+00"
+    prod = FakeConn([("FROM n8n_chat_histories", [
+        row(CHRIS, "I drive a Dodge Ram", id="a", at=T0, raw="2026-07-03 12:00:00.000001+00"),
+        row(CHRIS, "a very dense note", id="b", at=T0 + timedelta(seconds=1), raw="2026-07-03 12:00:01.000001+00"),
+    ])])
+    staging = FakeConn([("last_processed_at", [(existing_wm,)])])
+    llm = FakeLlm([cut_off("[{"), cut_off("[{"), OBS, cut_off("[{"), cut_off("[{")])
+    summary = run_extraction(prod, staging, llm, fake_embedder)
+
+    stats = summary["sources"]["prod_chat"]
+    assert stats["splits"] == 1 and stats["parse_failures"] == 1
+    assert not any("v2_memories_staging" in s for s, _ in staging.calls), "nothing half-landed"
+    save = next(p for s, p in staging.calls if "v2_extraction_watermark" in s and "INSERT" in s)
+    assert save["raw"] == existing_wm
+
+
+def test_the_model_can_never_make_a_private_conversation_public():
+    """#173: a plain-mode reply marked DM facts 'public'; the model may only tighten."""
+    from aerys_v2.workers.extraction import observation_privacy
+
+    private_group = {"privacy_level": "private"}
+    assert observation_privacy({"privacy_level": "public"}, private_group) == "private"
+    assert observation_privacy({"privacy_level": "weird"}, private_group) == "private"
+    assert observation_privacy({"privacy_level": "private"}, {"privacy_level": "public"}) == "private"
+    assert observation_privacy({"privacy_level": "public"}, {"privacy_level": "public"}) == "public"
+    assert observation_privacy({"privacy_level": "weird"}, {"privacy_level": "public"}) == "public"
+
+
+def test_private_and_public_turns_never_share_an_extraction_call():
+    """#173: a group's level is its first row's. A guild turn first must not carry a
+    DM turn's facts public, so the two never share a group."""
+    from aerys_v2.workers.extraction import group_by_person
+
+    rows = [dict(zip(SOURCE_COLUMNS, r)) for r in (
+        row(CHRIS, "I drive a Dodge Ram", id="g", privacy="public", platform="guild"),
+        row(CHRIS, "my surgery is on Friday", id="d", privacy="private", platform="discord_dm"),
+    )]
+    groups = group_by_person(rows)
+    assert len(groups) == 2
+    by_level = {g["privacy_level"]: [m["id"] for m in g["messages"]] for g in groups}
+    assert by_level == {"public": ["g"], "private": ["d"]}
+
+
+def test_the_schema_carries_privacy_so_the_model_can_tighten():
+    from aerys_v2.workers.extraction import _RESPONSE_FORMAT
+
+    item = _RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["observations"]["items"]
+    assert item["properties"]["privacy_level"]["enum"] == ["public", "private"]
+    assert "privacy_level" in item["required"]

@@ -107,3 +107,95 @@ def test_executor_exception_text_is_not_in_peer_spans(tmp_path):
         ]
     )
     provider.shutdown()
+
+
+def test_message_only_terminal_result_survives_later_bare_snapshot(tmp_path):
+    # A terminal task can carry its answer in status.message with no artifacts.
+    # A later same-state poll (equal or newer timestamp) that omits the message
+    # must not erase that evidence, while newly supplied artifacts still land.
+    store = ReceiptStore(tmp_path / "receipts.db")
+    row, _ = store.prepare_dispatch("dispatch", "peer", "hello")
+    done = Task(id="original", context_id=row["context"])
+    done.status.state = TaskState.TASK_STATE_COMPLETED
+    done.status.timestamp.seconds = 100
+    done.status.message.message_id = "reply"
+    done.status.message.parts.add(text="final answer")
+    store.record_dispatch("dispatch", "accepted", done)
+
+    bare = Task(id="original", context_id=row["context"])
+    bare.status.state = TaskState.TASK_STATE_COMPLETED
+    bare.status.timestamp.seconds = 100
+    store.record_dispatch("dispatch", "accepted", bare)
+    stored = json.loads(store.dispatch("dispatch")["task"])
+    assert stored["status"]["message"]["parts"][0]["text"] == "final answer"
+
+    newer = Task(id="original", context_id=row["context"])
+    newer.status.state = TaskState.TASK_STATE_COMPLETED
+    newer.status.timestamp.seconds = 200
+    newer.artifacts.add(artifact_id="late").parts.add(text="artifact")
+    store.record_dispatch("dispatch", "accepted", newer)
+    stored = json.loads(store.dispatch("dispatch")["task"])
+    assert stored["status"]["message"]["parts"][0]["text"] == "final answer"
+    assert stored["artifacts"][0]["parts"][0]["text"] == "artifact"
+    store.close()
+
+
+def test_peer_adapter_is_stateless_and_never_fetches_images():
+    # Review findings on PR #1: the per-task peer graph must not claim durable
+    # memory, and peer text naming a Discord CDN image must not trigger a fetch.
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    from aerys_v2.a2a.contracts import PeerRequest
+    from aerys_v2.a2a.executor import PeerAssistant
+
+    seen = []
+
+    class Capture(FakeListChatModel):
+        def invoke(self, prompt, *args, **kwargs):
+            seen.append(prompt)
+            return super().invoke(prompt, *args, **kwargs)
+
+    request = PeerRequest(
+        principal="alice",
+        task_id="t",
+        context_id="c",
+        thread_id="peer:alice:c",
+        text="look https://cdn.discordapp.com/attachments/1/2/cat.png",
+    )
+    with patch(
+        "aerys_v2.images.inline_current_images",
+        side_effect=AssertionError("peer graph fetched an image"),
+    ):
+        reply = PeerAssistant(Capture(responses=["ok"]))._ask(request)
+    assert reply == "ok"
+    system = seen[0][0].content
+    assert "stateless" in system
+    assert "memory is durable" not in system
+    assert "you see it yourself" not in system
+
+
+def test_owner_graph_defaults_still_inline_images_and_claim_memory():
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    from aerys_v2.factory import build_graph
+    from aerys_v2.service import ask
+
+    seen = []
+
+    def spy(prompt, **kwargs):
+        seen.append(prompt)
+        return prompt
+
+    with patch("aerys_v2.images.inline_current_images", side_effect=spy):
+        ask(
+            build_graph(FakeListChatModel(responses=["ok"]), "soul"),
+            "hello",
+            identity={
+                "user_id": "u",
+                "display_name": "U",
+                "privacy_context": "private",
+            },
+            thread_id="owner-thread",
+        )
+    assert seen, "default graph must keep inlining images"
+    assert "memory is durable" in seen[0][0].content

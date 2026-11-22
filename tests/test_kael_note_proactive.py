@@ -190,3 +190,91 @@ def test_model_failure_is_swallowed_and_note_survives():
     msg_id = note(f"person:{OWNER}", "note body", True)  # must not raise
     assert msg_id.startswith("kael-note-")
     assert len(graph.updates) == 1 and sends == []
+
+
+# --- 11/18 (the side agent's note): her note-turn has no tools, so it can't back an act --------------
+# Today's honesty gates (D61 promise, D65 status, the claim gate) run on her replies to his messages. The
+# note-turn is a bare model call with no tools; at 12:23 Kael's note told her she could withdraw a skill
+# request, and that turn could have said "withdrawing it now" with nothing able to do it. A reply that
+# says she did, is doing, or will now do something holds instead; the note stays in her thread for her
+# next real turn with him.
+import pytest
+
+
+@pytest.mark.parametrize("reply", [
+    "Withdrawing the MapTap skill request now, Chris.",
+    "I'll withdraw the skill request right away.",
+    "I've withdrawn the request.",
+    "Starting today's MapTap run now.",
+    "The MapTap run is still going on my home machine.",
+    "Done. I sent Kael the details.",
+    # Codex 11/18: plain past, a salutation first, and an explicit now over a date or "when"
+    "I withdrew the request.",
+    "I deleted the file.",
+    "Chris, I'm withdrawing the request now.",
+    "I'll cancel tomorrow's run now.",
+    "I'll update the ticket now so Kael knows when to start.",
+    # Codex re-check 11/18: her claim inside a quote or after a Kael clause; a task date; a second clause's
+    # timing; a negation in another sentence
+    'I can confirm: "I withdrew the request."',
+    "Kael asked and I withdrew it.",
+    "Kael asked, therefore I withdrew it.",
+    "I will cancel tomorrow's run.",
+    "I will withdraw it; I will update it tomorrow.",
+    "I cannot help with that. I will withdraw the request now.",
+    # Codex 11/18 (third pass): any effect verb follows the note rule; negation is the action's own clause
+    "I will schedule tomorrow's run.",
+    "Now I will send it when we talk.",
+    "No worries, I will withdraw the request now.",
+    "I am going to withdraw the request now.",
+    "Kael asked, so I am sending it now.",
+    # Codex 11/18 on D70: a possessive "morning's" is the report's, not the act's (straight and curly)
+    "I'll update the figures in the morning's report.",
+    "I'll update the figures in the morning\u2019s report.",
+])
+def test_a_note_turn_that_claims_an_act_holds_instead(reply):
+    g, sends = FakeGraph(), []
+    note_fn(g, SpeakModel(reply), sends)(f"person:{OWNER}", "you can withdraw the skill request", True)
+    assert sends == [] and len(g.updates) == 1          # only the note itself; nothing went to him
+
+
+@pytest.mark.parametrize("reply", [
+    "Chris, Kael says the demo notes landed. Proud of you.",
+    "Kael found why my MapTap skill was stuck at the door; he's fixing it.",
+    "Kael says I can withdraw that skill request; I'll do it next time we talk.",
+    # Codex 11/18: Kael's own acts, quoted or attributed, and a condition before her promise
+    'Kael said, "I sent the fix."',
+    "Kael's running the MapTap tests.",
+    "When we talk next, I'll withdraw it.",
+    # Codex re-check 11/18: a gerund that isn't an act
+    "That sounds sensible, deleting the file would be risky.",
+    "I enjoy reading, writing, and talking with you.",
+    "I'm running low on ideas, honestly.",
+    "I don't think I'll withdraw it.",
+    # D70 (his 17:45 "sure yeah"): an honest promise for a named later time speaks
+    "I'll check it tomorrow.",
+    "I'll look into it tonight.",
+    "I'll send Kael the details in the morning.",
+    "I'll start the MapTap run next week.",
+])
+def test_a_note_turn_that_only_tells_still_speaks(reply):
+    g, sends = FakeGraph(), []
+    note_fn(g, SpeakModel(reply), sends)(f"person:{OWNER}", "news", True)
+    assert len(sends) == 1 and sends[0][2] == reply
+
+
+
+def test_a_held_follow_up_is_on_the_desks_record_never_silent():
+    """D70: a held follow-up was invisible ("you aren't told"). It lands on the reach desk's record as a
+    dropped reach-out whose reason starts "held:", with her words; nothing is delivered."""
+    from test_reach_desk import DAY, World, desk_for
+    world = World()
+    desk, _ = desk_for(world, now=DAY)
+    g = FakeGraph()
+    note = kael_note_for(g, settings_with(), proactive_model=SpeakModel("I've withdrawn the request."),
+                         proactive_lookup_chat_id=lambda s: "7113937380",
+                         proactive_lookup_surface=lambda s: ("discord", None), proactive_sync=True, desk=desk)
+    note(f"person:{OWNER}", "you can withdraw the skill request", True)
+    rows = list(desk.store.rows.values())
+    assert len(rows) == 1 and rows[0].status == "dropped" and rows[0].reason.startswith("held:")
+    assert rows[0].headline == "I've withdrawn the request." and world.spoken == [] and world.texts == []

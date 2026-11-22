@@ -1,0 +1,164 @@
+"""reach_prefs — how often she reaches out on her own, and about what, from his own words.
+
+The owner, 2026-11-08 (D4): "3 a day plus briefs as a starting point but this can be
+adaptive, i'd like for an option for me to say chill out or annoy me more (not exactly in
+those words)." And D7: no emoji reactions, "this should be natural language". So he says it
+however he says it, she understands it, and this tool turns it into a change the desk
+enforces in code (reach.py): a daily budget (0 to 8) and topics he muted. Every change is
+recorded with his words, so "why did she go quiet?" always has an answer.
+
+Owner-side only, like kael_tickets (wired beside it in factory.py). Failure posture:
+ToolNode contract — honest strings, never raises.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from datetime import timedelta
+
+from dataclasses import replace
+
+from aerys_v2.reach import (BUDGET_MAX, BUDGET_MIN, CHECKINS_MAX, CHECKINS_MIN, COMPANY_DEFAULT, COMPANY_MAX,
+                            NAP_DEFAULT, NAP_MAX, EASTERN, active_mute_entries, mute_entry)
+
+log = logging.getLogger(__name__)
+
+#: Topics the desk knows. Safety warnings and answers he asked for can't be muted.
+TOPICS = ("kael", "weather", "calendar", "email", "follow-ups", "appointments", "to-dos", "brief", "evening",
+          "welcome", "messages")
+
+
+def build_reach_prefs_tool(store, *, default_budget: int = 3, clock=None):
+    from langchain_core.tools import tool
+
+    now = clock or (lambda: datetime.now(timezone.utc))
+
+    @tool
+    def reach_prefs(action: str, topic: str = "", his_words: str = "", minutes: int = 0, hours: int = 0) -> str:
+        """Change how often you reach out to the owner on your own, or what about, because he
+        told you to. CALL THIS when he asks for less or more, in whatever words he uses:
+        "ease up", "chill out", "you're pinging me a lot" mean less; "keep me posted more",
+        "annoy me more", "check in more" mean more. And when he asks to stop or restart
+        hearing about one kind of thing: "stop telling me about the weather" (mute weather),
+        "you can tell me about email again" (unmute email). Also when he asks what you'll
+        bring him on your own (show). When he says he's taking a nap or lying down for a bit
+        (nap): nothing you'd say aloud goes until he talks to you again or the time is up;
+        when he says he's up (awake). Your unasked check-ins (about his appointments and things
+        he said he'd do) have their own dial: "check on me more", "check in on me more often"
+        (checkins_more); "check on me less", "you don't have to check up on me so much"
+        (checkins_less); "stop checking up on me" (mute follow-ups); "don't ask about my
+        appointments" (mute appointments); "don't chase my to-dos" (mute to-dos). When he says
+        people are over ("we've got company", "my parents are here", "friends are over"):
+        company, so nothing you'd say aloud is said while they're here (it goes as text); when he
+        says they've left: company_gone.
+
+        A reply to your reach-out is feedback on THAT topic: "ugh, not now" means
+        quiet for a while; "not useful" or "stop sending these" means mute that kind.
+        Quote his words in his_words, tell him what changed and how to undo it (unmute).
+        Learning from a reply only makes you quieter: never more or checkins_more because
+        of a reply, even "thanks, love these". Explicit requests for more still use more.
+
+        action: "quiet", "less", "more", "mute", "unmute", "show", "nap", "awake", "checkins_more",
+          "checkins_less", "company" or "company_gone".
+        hours: for quiet (default 3, at most 24); for company, if he said how long (default 6, at most 24).
+        minutes: for nap, if he said how long (default 60, at most 180).
+        topic: for quiet, mute and unmute: messages (quotes from listed contacts), kael (news from Kael), weather, calendar, email,
+          follow-ups (all your unasked check-ins), appointments, to-dos, brief (your spoken
+          morning brief in his office), evening (your heads-up about tomorrow), or welcome
+          (your hello when he gets home: "don't greet me when I get home"). Storm
+          warnings, answers he asked for and check-backs he said yes to are never muted.
+        his_words: what he said, briefly, for the record.
+
+        Returns what changed, or what's set now. Tell him plainly what you changed.
+        """
+        act = (action or "").strip().lower()
+        words = " ".join((his_words or "").split())[:300]
+        try:
+            prefs = store.prefs(default_budget)
+            prefs = replace(prefs, muted=active_mute_entries(prefs, now()))
+            if act == "show":
+                labels = []
+                for entry in prefs.muted:
+                    key, end = mute_entry(entry)
+                    labels.append(f"{key} until {end.astimezone(EASTERN):%Y-%m-%d %H:%M %Z}"
+                                  if end is not None else key)
+                muted = ", ".join(labels) or "nothing"
+                nap = (f" A nap hold runs until {prefs.hold_until:%H:%M} UTC or until he talks to you."
+                       if prefs.hold_until is not None and prefs.hold_until > now() else "")
+                company = (" People are over: nothing said aloud until they leave."
+                           if prefs.company_until is not None and prefs.company_until > now() else "")
+                return (f"Up to {prefs.budget} unprompted message(s) a day, plus the briefs and anything "
+                        f"he asked for; up to {prefs.checkins} unasked check-in(s) of those. Muted: {muted}."
+                        f"{nap}{company}")
+            if act in ("less", "more"):
+                budget = max(BUDGET_MIN, min(BUDGET_MAX, prefs.budget + (1 if act == "more" else -1)))
+                if budget == prefs.budget:
+                    edge = "the most" if act == "more" else "the least"
+                    return f"Already at {edge} (up to {budget} a day); nothing changed."
+                store.set_prefs(replace(prefs, budget=budget), now(), f"budget {prefs.budget} -> {budget}", words)
+                return f"Changed: up to {budget} unprompted message(s) a day now (was {prefs.budget})."
+            if act == "nap":
+                span = timedelta(minutes=int(minutes)) if minutes and int(minutes) > 0 else NAP_DEFAULT
+                span = min(span, NAP_MAX)
+                start = now()
+                store.set_prefs(replace(prefs, hold_since=start, hold_until=start + span),
+                                start, f"nap {int(span.total_seconds() // 60)} min", words)
+                return (f"Holding: nothing said aloud for up to {int(span.total_seconds() // 60)} minutes, or until "
+                        "he talks to you again. Anything timely goes as a silent text.")
+            if act == "awake":
+                if prefs.hold_until is None:
+                    return "There was no nap hold; nothing changed."
+                store.set_prefs(replace(prefs, hold_since=None, hold_until=None), now(), "awake", words)
+                return "The nap hold is off; you can speak to him again."
+            if act in ("quiet", "mute", "unmute"):
+                key = (topic or "").strip().lower()
+                if key not in TOPICS:
+                    return f"NOT DONE: topic must be one of {', '.join(TOPICS)}."
+                muted = [m for m in prefs.muted if mute_entry(m)[0] != key]
+                if act == "quiet":
+                    start = now()
+                    end = start + timedelta(hours=min(int(hours), 24) if hours and int(hours) > 0 else 3)
+                    existing = [mute_entry(m)[1] for m in prefs.muted if mute_entry(m)[0] == key]
+                    if existing and (None in existing or max(existing) >= end):
+                        return f"{key} is already muted at least that long; nothing changed."
+                    muted.append(f"{key}@{end.astimezone(timezone.utc).isoformat()}")
+                    store.set_prefs(replace(prefs, muted=muted), start, f"quiet {key} until {end.isoformat()}", words)
+                    return (f"Changed: quiet on {key} until {end.astimezone(EASTERN):%Y-%m-%d %H:%M %Z}. "
+                            f"Undo with unmute {key}.")
+                if act == "mute":
+                    if key in prefs.muted:
+                        return f"{key} is already muted; nothing changed."
+                    muted.append(key)
+                elif len(muted) == len(prefs.muted):
+                    return f"{key} wasn't muted; nothing changed."
+                store.set_prefs(replace(prefs, muted=muted), now(), f"{act} {key}", words)
+                return (f"Changed: you won't bring up {key} on your own now." if act == "mute"
+                        else f"Changed: you can bring up {key} on your own again.")
+            if act in ("checkins_more", "checkins_less"):
+                n = max(CHECKINS_MIN, min(CHECKINS_MAX, prefs.checkins + (1 if act == "checkins_more" else -1)))
+                if n == prefs.checkins:
+                    edge = "the most" if act == "checkins_more" else "none"
+                    return f"Already at {edge} ({n} unasked check-ins a day); nothing changed."
+                store.set_prefs(replace(prefs, checkins=n), now(), f"check-ins {prefs.checkins} -> {n}", words)
+                return f"Changed: up to {n} unasked check-in(s) a day now (was {prefs.checkins})."
+            if act == "company":
+                span = min(timedelta(hours=int(hours)) if hours and int(hours) > 0 else COMPANY_DEFAULT, COMPANY_MAX)
+                start = now()
+                store.set_prefs(replace(prefs, company_until=start + span), start,
+                                f"company {int(span.total_seconds() // 3600)} h", words)
+                return (f"Discreet: nothing said aloud while people are over (it goes as text), until he says "
+                        f"they've left or {int(span.total_seconds() // 3600)} hours pass. Storm warnings still speak.")
+            if act == "company_gone":
+                if prefs.company_until is None or prefs.company_until <= now():
+                    return "There was no company setting on; nothing changed."
+                store.set_prefs(replace(prefs, company_until=None), now(), "company gone", words)
+                return "Company's gone: you can speak to him again."
+            return ('NOT DONE: action must be "quiet", "less", "more", "mute", "unmute", "show", "nap", "awake", '
+                    '"checkins_more", "checkins_less", "company" or "company_gone".')
+        except Exception:
+            log.warning("reach_prefs %s failed", act, exc_info=True)
+            return "NOT DONE: the reach settings couldn't be reached; nothing changed."
+
+    return reach_prefs

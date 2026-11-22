@@ -10,13 +10,17 @@ taught the pattern — the header check happens before ANYTHING else runs.
 """
 
 import hmac
+import threading
+import time
 import logging
+import unicodedata
+import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from aerys_v2.state import Identity
+from aerys_v2.state import Identity, VOICE_OWNER_ASSUMED_KEY
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +28,102 @@ log = logging.getLogger(__name__)
 #: The identity an unrecognized voice lands on. Named once so the door and the
 #: engage gate cannot drift on what "a stranger spoke" means.
 GUEST_VOICE_ID = "voice-guest"
+OWNER_HEARD_MAX = 256          # D43: devices remembered for the carry window
+OWNER_CARRY_MAX_S = 300        # the setting's ceiling (config.voice_owner_carry_s)
+#: T-17 (11/13): one forever-thread for every unrecognized voice let a 2 AM stray ("Call Ryan's nearest")
+#: answer his "Thank you" eight hours later. A guest conversation is a SESSION per device: after this
+#: many quiet seconds the next guest turn starts a fresh thread and sees nothing older.
+GUEST_SESSION_IDLE_S = 600
+
+
+_STOP_PHRASES = {
+    "stop", "stop talking", "stop it", "okay stop", "ok stop", "hold on",
+    "hold up", "thats enough", "enough", "be quiet", "quiet", "shush", "shh",
+}
+_STOP_NAMES = {"aerys", "harris", "iris", "ares", "aries", "eris"}
+#: 11/13: stop phrases that end a longer capture while she's talking ("…Air traffic control, that's
+#: enough"). Never a word that ends ordinary questions ("why is the office so quiet?", "is that enough?");
+#: a bare "stop" at the end counts only after her name or after her own words (see _ends_with_stop).
+_STOP_TAILS = {"stop talking", "stop it", "okay stop", "ok stop", "shut up", "be quiet", "thats enough",
+               "that is enough", "enough already", "hush", "shush", "shh", "stop please", "please stop"}
+_ECHO_RUN = 6
+_ECHO_HEARD_MAX, _ECHO_SAID_MAX = 80, 600       # bounded work per turn (Codex 11/13)
+_QUESTION_WORDS = {"who", "what", "when", "where", "why", "how", "which", "is", "are", "was", "were", "do",
+                   "does", "did", "can", "could", "would", "should", "will", "wont", "isnt", "arent", "didnt",
+                   "whats", "whos", "wheres", "whens", "whys", "hows", "whatre", "wheres"}
+
+
+def _asks(text: str) -> bool:
+    """A question, not a command: the speech-to-text marks it, or it opens like one."""
+    words = _words(text)
+    return (text or "").strip().endswith("?") or bool(words and words[0] in _QUESTION_WORDS)
+
+
+def _words(text: str) -> list[str]:
+    # Apostrophes disappear; other punctuation separates words.
+    return "".join(
+        "" if char in "'’" else " " if unicodedata.category(char).startswith("P") else char
+        for char in (text or "").lower()
+    ).split()
+
+
+def _is_echo(text: str, said: str) -> bool:
+    """11/13: her own voice coming back through the mic: a run of at least _ECHO_RUN of her recent words,
+    in order, making up nearly all of what it heard. A question about what she said ("were those bright
+    lights moving around?") shares a few words, never a long verbatim run (Codex 11/13)."""
+    run, heard = _echo_run(text, said)
+    if heard >= _ECHO_RUN and run == heard:
+        return True                     # word for word what she said, even her own question
+    if _asks(text):                     # "Why do the office lights…?" is his, whatever it quotes
+        return False
+    return heard >= _ECHO_RUN and run >= _ECHO_RUN and run >= 0.9 * heard
+
+
+def _echo_run(text: str, said: str) -> tuple[int, int]:
+    """(the longest run of her recent words, in order, inside what the mic heard; how many words it heard)."""
+    heard, hers = _words(text)[-_ECHO_HEARD_MAX:], _words(said)[-_ECHO_SAID_MAX:]
+    if not heard or not hers:
+        return 0, len(heard)
+    best, prev = 0, [0] * (len(hers) + 1)
+    for h in heard:
+        cur = [0] * (len(hers) + 1)
+        for j, w in enumerate(hers, 1):
+            if w == h:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best, len(heard)
+
+
+def _ends_with_stop(text: str, said: str = "") -> bool:
+    """11/13: while she's talking the mic hears her too ("…Air traffic control stop."): a stop at the END
+    of what it heard is his. A bare "stop" there counts after her name, or after her own words."""
+    if _is_stop_phrase(text):
+        return True
+    if _asks(text):                     # "Why did you stop talking?" is a question, not a stop
+        return False
+    run, heard = _echo_run(text, said)
+    if heard >= _ECHO_RUN and run == heard:
+        return False                    # her own words ("…please stop talking") are not his stop
+    words = _words(text)
+    named = False
+    while words and words[-1] in _STOP_NAMES:
+        words, named = words[:-1], True
+    if any(len(words) >= n and " ".join(words[-n:]) in _STOP_TAILS for n in (1, 2, 3)):
+        return True
+    if words and words[-1] == "stop":
+        before = words[:-1]
+        return named or bool(before and before[-1] in _STOP_NAMES) or _is_echo(" ".join(before), said)
+    return False
+
+
+def _is_stop_phrase(text: str) -> bool:
+    words = _words(text)
+    if words and words[0] in _STOP_NAMES:
+        words = words[1:]
+    if words and words[-1] in _STOP_NAMES:
+        words = words[:-1]
+    return " ".join(words) in _STOP_PHRASES
 
 
 class SpeakerTag(BaseModel):
@@ -54,14 +154,54 @@ class AskRequest(BaseModel):
     # 2026-08-26). Absent/None = no surface styling, byte-for-byte old behavior.
     surface: str | None = None
     # Speaker ID (2026-09-20): set by HA's aerys_conversation from the
-    # aerys_speaker_stt wrapper's verdict — {"id": "chris"|"megan"|"unknown",
+    # aerys_speaker_stt wrapper's verdict — {"id": "chris"|"<another enrolled voice>"|"unknown",
     # "confidence": 0.71}. Absent = untagged = the owner (pre-speaker-ID behavior).
     speaker: SpeakerTag | None = None
+
+
+class HushRequest(BaseModel):
+    """The office button (Chris 11/13): which satellite it sits beside."""
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class StoppedRequest(BaseModel):
+    """HA, when a satellite hears a wake word (11/14). Its firmware already cut her off itself if she
+    was talking. state is HA's read of that satellite then, and changed_s how long ago it changed:
+    the firmware's own stop can flip "responding" to "idle" before HA reads it (Codex 11/14)."""
+    device_id: str = Field(min_length=1, max_length=128)
+    wake_word: str = Field(default="", max_length=64)
+    state: str = Field(default="", max_length=32)
+    changed_s: float | None = Field(default=None, ge=0)
+    # When HA got the wake word (epoch seconds): the hold dates from then, so an ask he began after it
+    # is never held, and a notice that arrives late is dropped (Codex 11/14).
+    at: float | None = Field(default=None, ge=0)
+
+
+#: an idle satellite that changed this recently was talking a moment ago: her name then was a stop
+JUST_STOPPED_S = 3.0
+#: a wake-word notice older than this is stale (HA and the rack are on one LAN, both on NTP)
+STOPPED_STALE_S = 10.0
+
+
+def _open_mic(settings, satellite: str) -> None:
+    """Open a satellite's mic as if he'd said her name (the keep-listening reopen, on demand)."""
+    import httpx
+
+    from aerys_v2.factory import OPEN_MIC_MESSAGE
+
+    r = httpx.post(
+        f"{settings.ha_base_url.rstrip('/')}/api/services/assist_satellite/start_conversation",
+        headers={"Authorization": f"Bearer {settings.ha_token.get_secret_value()}"},
+        json={"entity_id": satellite, "start_message": OPEN_MIC_MESSAGE, "preannounce": False},
+        timeout=15.0,
+    )
+    r.raise_for_status()
 
 
 class AskReply(BaseModel):
     reply: str
     thread_id: str
+    keep_listening: bool = False
 
 
 class KaelNoteRequest(BaseModel):
@@ -82,9 +222,25 @@ class KaelNoteReply(BaseModel):
     message_id: str
 
 
+class KaelTicketUpdate(BaseModel):
+    """POST /kael-ticket/{id} — Kael's word on a ticket she opened (board #176).
+
+    status is an A2A task state Kael may set: working, input-required, completed,
+    failed, canceled. text is required when it goes back to the owner
+    (input-required, completed, failed): an answer with no words is the 1-way
+    line all over again.
+    """
+
+    status: str
+    text: str = ""
+    family_visible: bool = False
+
+
 def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
               gaps_fn=None, health_probe=None, kael_note_fn=None,
-              a2a_memory_fn=None, settings=None, speaker_redirect=None) -> FastAPI:
+              a2a_memory_fn=None, settings=None, speaker_redirect=None, satellite_voice=None,
+              kael_tickets=None, home_notice_fn=None, home_webhook_token: str | None = None,
+              guest_clock=None) -> FastAPI:
     """App factory — ask_fn injected like every other transport (testable with fakes).
 
     owner_person_id: when set, every authed HTTP caller IS the owner. The Bearer
@@ -113,9 +269,15 @@ def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
     # dependency (this is the general HTTP door), while reusing the ONE canonical
     # person-thread key builder the text gateways use — no drift on the format.
     from aerys_v2.transports.discord_gateway import person_thread_key
-    from aerys_v2.config import speaker_person_map
+    from aerys_v2.config import speaker_person_map, home_job_member_map
+
+    from aerys_v2.keep_listening import ToggleReader, consume_dismissal, mark_opened
+
+    toggle = ToggleReader(settings)
 
     speaker_persons = speaker_person_map(settings) if settings is not None else {}
+
+    members = home_job_member_map(settings) if settings is not None else {}
 
     def resolve_speaker(speaker_id: str, confidence: float) -> tuple[str, str] | None:
         """(user_id, display_name) for a tagged voice turn, or None = leave it the owner's.
@@ -130,13 +292,16 @@ def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
         name = (speaker_id or "unknown").strip().lower()
         said_unknown = name == "unknown"   # what the RECOGNIZER said, before our floor
         if confidence < settings.voice_speaker_min_confidence:
+            person = speaker_persons.get(name)
+            if person in members:
+                return person, f"{name.capitalize()} (Voice)"
             name = "unknown"
         if said_unknown and confidence >= settings.voice_guest_demote_below:
             # Not a match, but not a stranger either — too close to call. The owner
             # keeps his own turn rather than being answered as a guest in his house.
             # Only when the RECOGNIZER itself was unsure: a NAMED match knocked down
             # by voice_speaker_min_confidence must never land on the owner — that
-            # would hand Megan's uncertain turn to Chris, which is the worse error.
+            # would hand his wife's uncertain turn to Chris, which is the worse error.
             return None
         person = speaker_persons.get(name)
         if person is not None:
@@ -146,6 +311,58 @@ def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
         if settings.voice_unknown_speaker == "guest":
             return GUEST_VOICE_ID, "Guest (Voice)"
         return None
+
+    def owner_confirmed(speaker_id: str, confidence: float) -> bool:
+        """A NAMED match to the owner's own print at or above the floor. Anything else
+        that still lands on the owner (untagged, or the recognizer's unsure band) is
+        his turn by default only: chat answers it as his, memory never takes it (D2)."""
+        if settings is None:
+            return False
+        name = (speaker_id or "").strip().lower()
+        return (speaker_persons.get(name) == owner_person_id
+                and confidence >= settings.voice_speaker_min_confidence)
+
+    clock = guest_clock or time.monotonic
+    guest_sessions: dict[str, tuple[float, str]] = {}
+    guest_lock = threading.Lock()
+    owner_heard: dict[str, float] = {}         # D43: when each device last heard HIM (never a carried clip)
+
+    def heard_owner(device_id) -> None:
+        if not device_id:
+            return
+        with guest_lock:
+            now = clock()
+            owner_heard[str(device_id)] = now
+            if len(owner_heard) > OWNER_HEARD_MAX:
+                # Bounded (Codex 11/13): an entry past the longest window is useless; then the oldest go.
+                for k in [k for k, seen in owner_heard.items() if now - seen > OWNER_CARRY_MAX_S]:
+                    owner_heard.pop(k, None)
+                for k in sorted(owner_heard, key=owner_heard.get)[:max(0, len(owner_heard) - OWNER_HEARD_MAX)]:
+                    owner_heard.pop(k, None)
+
+    def owner_just_spoke(device_id) -> float | None:
+        """D43: seconds since this device last heard him, when inside voice_owner_carry_s; else None."""
+        window = int(getattr(settings, "voice_owner_carry_s", 0) or 0) if settings is not None else 0
+        if not device_id or window <= 0:
+            return None
+        with guest_lock:
+            seen = owner_heard.get(str(device_id))
+            age = None if seen is None else clock() - seen
+        return age if age is not None and 0 <= age <= window else None
+
+    def guest_thread(device_id) -> str:
+        """The guest's thread for THIS conversation: per device, and new after GUEST_SESSION_IDLE_S of quiet."""
+        key = str(device_id or "-")
+        with guest_lock:
+            now = clock()
+            last, session = guest_sessions.get(key, (None, ""))
+            if not session or last is None or now - last >= GUEST_SESSION_IDLE_S:
+                session = f"{key}:{int(time.time())}-{uuid.uuid4().hex[:6]}"   # unique even within a second
+            guest_sessions[key] = (now, session)
+            if len(guest_sessions) > 256:                      # bounded: forget devices quiet a day or more
+                for k in [k for k, (seen, _) in guest_sessions.items() if now - seen >= 86400]:
+                    guest_sessions.pop(k, None)
+        return f"{person_thread_key(GUEST_VOICE_ID)}:{session}"
 
     def voice_thread() -> str:
         """The checkpointer thread a voice turn rides. When an owner is configured (the
@@ -288,35 +505,198 @@ def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
         # person_id" bug, 2026-07-05). Both paths get ack-then-act, emotion tags, and
         # content tagged fail-closed 'private' at ingest like a DM. A plain caller
         # (voice=False, non-voice thread — curl/tests) is byte-for-byte unchanged.
+        owner_turn = False                           # D43: a voice turn that was surely or likely HIM
         if body.voice or str(body.thread_id or "").startswith("voice"):
+            from aerys_v2.speaker_redirect import turn_started
+
+            turn_started(body.device_id)        # what this turn says later is from a turn begun now
             identity["voice"] = True
             thread_id = voice_thread()
-            if body.speaker is not None:
+            if body.speaker is None:
+                if owner_person_id:
+                    identity[VOICE_OWNER_ASSUMED_KEY] = True    # untagged: his by default only
+            else:
                 # Who spoke decides WHOSE turn this is. The Bearer proved the owner's
                 # infrastructure is calling; the voice decides the person.
                 who = resolve_speaker(body.speaker.id, body.speaker.confidence)
+                # D43 (11/13): the recognizer named no one, and this speaker heard him moments ago ("Thank
+                # you." after his ask is too short to score): his turn by default only, never a named voice.
+                carried = None
+                if (who is not None and who[0] == GUEST_VOICE_ID and owner_person_id
+                        and (body.speaker.id or "unknown").strip().lower() == "unknown"):
+                    carried = owner_just_spoke(body.device_id)
+                    if carried is not None:
+                        who = None
+                        log.info("voice: an unknown clip on %s %ds after him counts as his by default (D43)",
+                                 body.device_id, int(carried))
+                if who is None and owner_person_id and not owner_confirmed(body.speaker.id, body.speaker.confidence):
+                    identity[VOICE_OWNER_ASSUMED_KEY] = True    # the unsure band: his by default only
                 # The DOOR decides whether a verdict demotes; the gate obeys that flag
                 # rather than re-reading the id, so the two can never disagree.
                 demoted = who is not None and who[0] == GUEST_VOICE_ID
                 identity["speaker"] = {"id": body.speaker.id, "confidence": body.speaker.confidence,
                                        "demoted": demoted}
+                if carried is not None:
+                    identity["speaker"]["carried"] = True
+                elif who is None and owner_person_id:
+                    heard_owner(body.device_id)              # his own turn (named or the unsure band)
+                    owner_turn = True
+                if who is not None and who[0] in members and body.speaker.confidence < settings.voice_speaker_min_confidence:
+                    identity["speaker"]["unsure"] = True
                 if who is not None:
                     identity["user_id"], identity["display_name"] = who
-                    thread_id = person_thread_key(who[0])
+                    thread_id = (guest_thread(body.device_id) if who[0] == GUEST_VOICE_ID
+                                 else person_thread_key(who[0]))
         else:
             thread_id = body.thread_id
+        is_voice = bool(identity.get("voice"))
+        # Consume even when OFF, so re-enabling cannot resurrect an answered mic.
+        dismissed = is_voice and consume_dismissal(body.device_id, body.text)
+        # D34 barge-in, 11/13: while her voice plays on the desk speakers (or more is queued), anything
+        # he says there cuts her off first (and holds what's on its way: the hush). A stop at the END of
+        # what the mic heard, or a capture that is her own voice coming back, ends it there with no model
+        # call; anything else is his new ask. (11/13 18:08: "…Air traffic control stop." missed the old
+        # whole-phrase check and she talked on.) After the dismissal above, so a "stop" also clears a mic.
+        if (is_voice and speaker_redirect is not None
+                and getattr(speaker_redirect, "handles", lambda _d: False)(body.device_id)
+                and getattr(speaker_redirect, "quick_playing", lambda _d: False)(body.device_id) is True):
+            from aerys_v2.speaker_redirect import hush, recent_said, turn_started
+
+            said = recent_said(body.device_id)
+            if not _ends_with_stop(body.text, said) and _is_echo(body.text, said):
+                # Only her own voice came back through the mic: nobody spoke, so she carries on.
+                log.info("voice: on %s the mic heard only her own voice; dropped, she carries on", body.device_id)
+                return AskReply(reply="", thread_id=thread_id, keep_listening=False)
+            hushed = hush(body.device_id)
+            speaker_redirect.stop(body.device_id, hush_at=hushed)
+            if _ends_with_stop(body.text, said):
+                log.info("voice: barge-in on %s; he said stop", body.device_id)
+                return AskReply(reply="", thread_id=thread_id, keep_listening=False)
+            turn_started(body.device_id)        # his new words start after the hush: their answer plays
+            log.info("voice: barge-in on %s; she stopped for his new words", body.device_id)
+        if dismissed and toggle.enabled():
+            return AskReply(reply="", thread_id=thread_id)
         reply = ask_fn(body.text, identity, thread_id)
+        if owner_turn:
+            heard_owner(body.device_id)                  # D43: the window runs from when she finished answering him
+        keep_listening = False
+        if is_voice:
+            from aerys_v2.service import strip_emotion_tags
+
+            keep_listening = strip_emotion_tags(reply).strip().endswith("?") and toggle.enabled()
+
         # Speaker redirect (2026-09-26): a voice turn from a satellite whose speaker
         # is gone is also spoken on the redirect target (Leviathan's desk speakers).
         if identity.get("voice") and speaker_redirect is not None:
-            speaker_redirect.say(body.device_id, reply)
+            if keep_listening and speaker_redirect.handles(body.device_id):
+                from aerys_v2.factory import OPEN_MIC_MESSAGE, satellite_map_from
+                import httpx
+
+                # The dead speaker finishes immediately. Only the redirect's
+                # playback acknowledgement may reopen this satellite's mic.
+                keep_listening = False
+                satellite = satellite_map_from(settings.ha_satellite_map).get(body.device_id)
+                if satellite and settings.ha_token is not None:
+                    def reopen() -> None:
+                        r = httpx.post(
+                            f"{settings.ha_base_url.rstrip('/')}/api/services/assist_satellite/start_conversation",
+                            headers={"Authorization": f"Bearer {settings.ha_token.get_secret_value()}"},
+                            json={"entity_id": satellite, "start_message": OPEN_MIC_MESSAGE, "preannounce": False},
+                            timeout=15.0,
+                        )
+                        r.raise_for_status()
+                        mark_opened(body.device_id)
+
+                    speaker_redirect.say(body.device_id, reply, then=reopen)
+                else:
+                    speaker_redirect.say(body.device_id, reply)
+            else:
+                speaker_redirect.say(body.device_id, reply)
         # Gap #37: an exchange on Kael's line becomes a durable memory, so the
         # her on any OTHER thread can know it happened. Fires on the FINAL
         # thread_id — a voice turn was already remapped off kael:* above, so
         # voice never lands here. The writer gates + fails open internally.
         if a2a_memory_fn is not None:
             a2a_memory_fn(thread_id, body.text, reply)
-        return AskReply(reply=reply, thread_id=thread_id)
+        if keep_listening:
+            mark_opened(body.device_id)
+        return AskReply(reply=reply, thread_id=thread_id, keep_listening=keep_listening)
+
+    @app.post("/voice/hush-or-listen")
+    def hush_or_listen(body: HushRequest, _: None = Depends(require_token)) -> dict:
+        """Chris 11/13 ("a shut up and listen toggle"): his office button 4. If she's talking there (a
+        clip playing or more queued), she stops and the queue is dropped; if she's quiet, that satellite's
+        mic opens as if he'd said her name. A button can't be misheard."""
+        from aerys_v2.speaker_redirect import hush
+
+        device = body.device_id
+        redirected = speaker_redirect is not None and speaker_redirect.handles(device)
+        if redirected and speaker_redirect.playing(device):
+            hushed = hush(device)               # first: nothing on its way starts her up again
+            if not speaker_redirect.stop(device, hush_at=hushed):
+                log.warning("voice: the button pressed on %s, but the speaker didn't confirm the stop", device)
+                return {"did": "nothing", "why": "the speaker didn't stop"}
+            log.info("voice: the button hushed her on %s", device)
+            return {"did": "hushed"}
+        # 11/14 (the Pebble): her voice back on the satellite's own speaker; the satellite stops her there.
+        if not redirected and satellite_voice is not None and satellite_voice.handles(device):
+            talking = satellite_voice.talking(device)
+            if talking is None:                 # HA can't say: neither a stop nor an open mic is a guess
+                log.warning("voice: the button pressed on %s, but HA couldn't say whether she's talking", device)
+                return {"did": "nothing", "why": "couldn't tell whether she's talking"}
+        else:
+            talking = False
+        if talking:
+            hushed = hush(device)               # first: nothing on its way starts her up again
+            if not satellite_voice.stop(device):
+                # The hush stays: he pressed to quiet her, so what's still coming stays unsaid.
+                log.warning("voice: the button pressed on %s, but the satellite didn't stop", device)
+                return {"did": "nothing", "why": "the satellite didn't stop"}
+            satellite_voice.guard(device, hushed)
+            log.info("voice: the button hushed her on %s (the satellite)", device)
+            return {"did": "hushed"}
+        from aerys_v2.factory import satellite_map_from
+
+        satellite = satellite_map_from(settings.ha_satellite_map).get(device) if settings is not None else None
+        if not satellite or settings.ha_token is None:
+            return {"did": "nothing", "why": "no satellite for that device"}
+        try:
+            _open_mic(settings, satellite)
+        except Exception:
+            log.warning("voice: the button couldn't open the mic on %s", device)
+            return {"did": "nothing", "why": "the mic didn't open"}
+        mark_opened(device)
+        log.info("voice: the button opened the mic on %s", device)
+        return {"did": "listening"}
+
+    @app.post("/voice/stopped")
+    def voice_stopped(body: StoppedRequest, _: None = Depends(require_token)) -> dict:
+        """11/14: a satellite heard a wake word. While she talks there, its firmware cuts her off itself
+        ("stop", or her name) and starts no new turn, so the brain never hears it; HA passes it on and
+        this holds what that turn still had to say. "stop" is only armed while she talks; her name
+        counts when HA read the satellite as talking. A desk-redirected satellite stays the door's job."""
+        from aerys_v2.speaker_redirect import hush
+
+        device = body.device_id
+        if satellite_voice is None or not satellite_voice.handles(device):
+            return {"did": "nothing", "why": "not a satellite of hers"}
+        if speaker_redirect is not None and speaker_redirect.handles(device):
+            return {"did": "nothing", "why": "that satellite speaks through the desk"}
+        state = body.state.strip().lower()
+        talking = state == "responding" or (
+            state == "idle" and body.changed_s is not None and body.changed_s <= JUST_STOPPED_S)
+        if body.wake_word.strip().lower() != "stop" and not talking:
+            return {"did": "nothing"}           # she was quiet: a new ask, its own turn
+        hushed = hush(device, at=body.at)       # dated when heard: turns he began after it are spared
+        if body.at is not None and body.at < time.time() - STOPPED_STALE_S:
+            # Late: still hold what that turn had to say, but a second stop now could hit a newer answer.
+            log.warning("voice: a late stop notice for %s (%.0f s old); held, no second stop",
+                        device, time.time() - body.at)
+            return {"did": "held", "why": "late notice: no second stop"}
+        satellite_voice.guard(device, hushed)
+        log.info("voice: the satellite on %s stopped her (%s); what's on its way is held",
+                 device, body.wake_word.strip() or "a wake word")
+        return {"did": "held"}
 
     @app.post("/kael-note", response_model=KaelNoteReply)
     def kael_note_route(
@@ -333,6 +713,67 @@ def build_app(ask_fn, api_token: str | None, owner_person_id: str | None = None,
             body.thread_id.strip(), body.text.strip(), body.family_visible
         )
         return KaelNoteReply(ok=True, message_id=msg_id)
+
+    # Kael tickets (board #176): her asks come back, and the owner's come back to him.
+    # kael_tickets is a tickets.TicketDoor; unarmed (DB-less dev) = honest 503.
+    def _ticket_door():
+        if kael_tickets is None:
+            raise HTTPException(status_code=503, detail="kael tickets not armed")
+        return kael_tickets
+
+    @app.get("/kael-tickets")
+    def kael_tickets_route(open_only: bool = True, limit: int = 20,
+                           _: None = Depends(require_token)) -> dict:
+        door = _ticket_door()
+        rows = door.store.recent(limit=max(1, min(limit, 100)), open_only=open_only)
+        return {"tickets": [t.public() for t in rows]}
+
+    @app.get("/kael-ticket/{ticket_id}")
+    def kael_ticket_get(ticket_id: int, _: None = Depends(require_token)) -> dict:
+        ticket = _ticket_door().store.get(ticket_id)
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="no such ticket")
+        return ticket.public()
+
+    @app.post("/kael-ticket/{ticket_id}")
+    def kael_ticket_update(ticket_id: int, body: KaelTicketUpdate,
+                           _: None = Depends(require_token)) -> dict:
+        from aerys_v2.tickets import KAEL_STATUSES, OWED_TO_OWNER
+
+        door = _ticket_door()
+        if body.status not in KAEL_STATUSES:
+            raise HTTPException(status_code=422,
+                                detail=f"status must be one of {', '.join(KAEL_STATUSES)}")
+        if body.status in OWED_TO_OWNER and not body.text.strip():
+            raise HTTPException(status_code=422, detail=f"{body.status} needs text")
+        ticket = door.update(ticket_id, body.status, body.text, body.family_visible)
+        if ticket is None:
+            raise HTTPException(status_code=404, detail="no such ticket")
+        return ticket.public()
+
+    # Her home body's "I'm done" (board #176, Stage 3; home_notices.py). Its OWN token, not
+    # api_token: the home body only ever says a job ended, never drives /ask. Unarmed = 503.
+    # The notice is written down and answered at once (202); the worker tells the owner.
+    @app.post("/home-notice", status_code=202)
+    async def home_notice_route(request: Request) -> dict:
+        if home_notice_fn is None or not (home_webhook_token or "").strip():
+            raise HTTPException(status_code=503, detail="home notices not armed")
+        auth = request.headers.get("authorization", "")
+        if not hmac.compare_digest(auth, f"Bearer {home_webhook_token}"):
+            raise HTTPException(status_code=401, detail="bad token")
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="body must be JSON") from None
+        from starlette.concurrency import run_in_threadpool
+
+        try:
+            # Off the event loop: writing it down is a database round trip, and a slow
+            # database must never stall /ask or /health behind it.
+            outcome = await run_in_threadpool(home_notice_fn, payload)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from None
+        return {"ok": True, "notice": outcome}
 
     @app.get("/gaps")
     def gaps_route(_: None = Depends(require_token)) -> dict:

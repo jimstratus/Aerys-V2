@@ -10,7 +10,7 @@ Two things the sensors cannot do, which the wording here is careful about:
 
 1. They cannot name WHO. Several rooms read occupied at once (office and living room
    both on while this was written), and an occupancy sensor does not distinguish Chris
-   from Megan from a passing cat. So this reports OCCUPANCY, never "Chris is in the
+   from his wife from a passing cat. So this reports OCCUPANCY, never "Chris is in the
    sunroom" — claiming the latter would be the same error as treating a matching name
    as an identification.
 2. They cannot be trusted as a safety signal. Everything here is fail-open: a dark or
@@ -25,7 +25,12 @@ turns only; presence_block() enforces it, not the caller.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from aerys_v2.house_names import NAMES, wife_or
 
 log = logging.getLogger(__name__)
 
@@ -65,14 +70,84 @@ def parse_rooms(spec: str) -> dict[str, str]:
 
 # She invented "his phone pinged home a minute ago" on the first good probe (2026-10-03).
 NO_TIMES = "This is his state right now; it carries no times, so never say when he arrived or moved."
+NO_TIMES_ZONE = ("This is his state right now; apart from his local clock above, it carries no times, "
+                 "so never say when he arrived or moved.")
 
 
-def format_whereabouts(home: str | None, settled: str | None) -> list[str]:
+def location_fields(attributes: object, *, nearby: bool = False) -> dict[str, str]:
+    """Discard all unapproved geocoder fields before any formatting or output."""
+    if not isinstance(attributes, dict):
+        return {}
+    keys = ("locality", "administrative_area", "country")
+    if nearby:
+        keys += ("sub_locality", "thoroughfare")
+    return {key: value.strip() for key in keys
+            if isinstance(value := attributes.get(key), str)
+            and value.strip() and value.strip().lower() not in ("unknown", "unavailable", "none", "null")}
+
+
+LocalZone = tuple[timedelta, str]
+EASTERN = ZoneInfo("America/New_York")
+# The zone presence_block chose to show THIS turn (owner, private, not voice), in a fresh
+# holder per ask that copied contexts share. The calendar reads it here, so it can never
+# show a zone the presence fence withheld (Gemini review, 2026-11-03).
+TRAVEL_ZONE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("aerys_travel_zone", default=None)
+
+
+def current_travel_zone() -> LocalZone | None:
+    holder = TRAVEL_ZONE.get()
+    return holder.get("zone") if holder is not None else None
+
+
+def parse_local_zone(offset: object, name: object) -> LocalZone | None:
+    """Validate companion-app offsets in milliseconds, never infer from its label."""
+    if (type(offset) is not int or abs(offset) > 14 * 60 * 60 * 1000
+            or offset % (15 * 60 * 1000)):
+        return None
+    if (not isinstance(name, str) or not name.strip() or len(name) > 64
+            or name.strip().lower() in ("unknown", "unavailable", "none", "null")):
+        return None
+    return timedelta(milliseconds=offset), name.strip()
+
+
+def valid_local_zone(value: object) -> LocalZone | None:
+    """Validate the internal pair too: callers and optional providers may be faulty."""
+    if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[0], timedelta):
+        return None
+    offset, name = value
+    milliseconds = offset // timedelta(milliseconds=1)
+    if offset != timedelta(milliseconds=milliseconds):
+        return None
+    return parse_local_zone(milliseconds, name)
+
+
+def _clock(dt: datetime) -> str:
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _local_time_lines(zone: LocalZone) -> list[str]:
+    offset, name = zone
+    now = datetime.now(UTC)
+    eastern = now.astimezone(EASTERN)
+    local = now.astimezone(timezone(offset))
+    hours = (offset - eastern.utcoffset()).total_seconds() / 3600
+    comparison = "the same as Eastern" if not hours else (
+        f"{abs(hours):g} {'hour' if abs(hours) == 1 else 'hours'} "
+        f"{'ahead of' if hours > 0 else 'behind'} Eastern")
+    example = eastern.replace(hour=10, minute=0, second=0, microsecond=0).astimezone(timezone(offset))
+    return [f"His local time there is {_clock(local)} ({name}), {comparison}.",
+            "Times from his calendar are in Eastern unless they say otherwise: always tell him "
+            f"times in his local time. For example, 10:00 AM Eastern is {_clock(example)} for him.",
+            "This zone is current, not a memory: never save it."]
+
+
+def format_whereabouts(home: str | None, settled: str | None, city: dict | None = None,
+                       local_zone: LocalZone | None = None) -> list[str]:
     """Where CHRIS is, at the trust the week-long soak earned (Chris approved 2026-10-03).
 
     The BLE soak, 9/27-10/03: home/away never put him in a room while he was out (7
     nights), and his phone's settled room agreed with the office sensors 99.5% of the
-    time; the bedroom read 50% (Megan, the cats, a still sleeper), and the settled room
+    time; the bedroom read 50% (his wife, the cats, a still sleeper), and the settled room
     lags a move by about 6 minutes. So home/away and "most likely in the office" are
     stated; any other room is a soft guess she may mention lightly and never act on.
     """
@@ -80,7 +155,19 @@ def format_whereabouts(home: str | None, settled: str | None) -> list[str]:
     if not state or state in ("unknown", "unavailable"):
         return []
     if state != "home":
-        return ["Chris's own phone says he is away from home right now.", NO_TIMES]
+        zone = valid_local_zone(local_zone)
+        extra = _local_time_lines(zone) if zone else []
+        fields = location_fields(city)
+        if fields.get("locality"):
+            place = ", ".join(fields[k] for k in ("locality", "administrative_area") if fields.get(k))
+            return [f"Chris's own phone says he is away from home, in {place} right now.",
+                    ("Use this city for suggestions. " if zone else "Use this city for local time and suggestions. ")
+                    + "For weather where he is, search the "
+                    "web for this city: the weather tool reads the HOUSE forecast, not his. It is current, "
+                    "not a memory: never save it, and never claim a more exact location than the city.",
+                    *extra, NO_TIMES_ZONE if zone else NO_TIMES]
+        return ["Chris's own phone says he is away from home right now.", *extra,
+                NO_TIMES_ZONE if zone else NO_TIMES]
     # Attributed to HIS phone, out loud: the occupancy caveat below ("sensors do not say
     # WHO") made her doubt these lines too on the first live probe (2026-10-03).
     lines = ["Chris's own phone says he is home - that is him, so you can say it plainly."]
@@ -96,7 +183,8 @@ def format_whereabouts(home: str | None, settled: str | None) -> list[str]:
 
 
 def format_presence(occupied: list[str], spoken_from: str | None = None,
-                    whereabouts: tuple | None = None) -> str:
+                    whereabouts: tuple | None = None, city: dict | None = None,
+                    local_zone: LocalZone | None = None) -> str:
     """The block's text, or '' when there is nothing honest to say.
 
     Occupancy is phrased as occupancy, never as a person's location, and it says the
@@ -104,7 +192,9 @@ def format_presence(occupied: list[str], spoken_from: str | None = None,
     location is stated, and only at the trust format_whereabouts allows.
     """
     # The satellite he is speaking through beats a phone room that lags by minutes.
-    where = format_whereabouts(whereabouts[0], None if spoken_from else whereabouts[1]) if whereabouts else []
+    where = format_whereabouts(whereabouts[0], None if spoken_from else whereabouts[1],
+                               None if spoken_from else city,
+                               None if spoken_from else local_zone) if whereabouts else []
     if not occupied and not spoken_from and not where:
         return ""
     lines = list(where)
@@ -113,7 +203,7 @@ def format_presence(occupied: list[str], spoken_from: str | None = None,
     if occupied:
         rooms = ", ".join(occupied)
         lines.append(f"Rooms showing occupancy right now: {rooms}.")
-        lines.append("Occupancy sensors do not say WHO — that could be Megan or a pet. "
+        lines.append(f"Occupancy sensors do not say WHO — that could be {wife_or(NAMES)} or a pet. "
                      "Use this as ambient awareness; never assert where someone is from occupancy alone"
                      + (" (this caveat is about the room sensors, not his phone)." if where else "."))
     elif spoken_from or not where:

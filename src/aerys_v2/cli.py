@@ -4,7 +4,15 @@ from pydantic import ValidationError
 from aerys_v2.config import BootConfigError, Settings, run_boot_assertions
 from aerys_v2.privacy_shadow import privacy_shadow_for
 from aerys_v2.speaker_redirect import speaker_redirect_for
+from aerys_v2.satellite_voice import satellite_voice_for
 from aerys_v2.reflex import live_router_for, reflex_for
+
+
+def _action_context(settings) -> dict:
+    """#182's knobs for build_graph: what her hands see of the thread. Imported here because
+    factory is heavy and this module keeps it out of import time."""
+    from aerys_v2.factory import action_context_kwargs
+    return action_context_kwargs(settings)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -80,7 +88,7 @@ def main() -> None:
 
     if "--ask" in sys.argv:  # one-shot turn: aerys-v2 --ask "hello" — the first REAL call path
         from aerys_v2.factory import build_graph, build_model, load_soul
-        from aerys_v2.service import ask
+        from aerys_v2.service import ask, text_one_loop_flag
 
         from aerys_v2.factory import checkpointer_for, turn_recorder_for
 
@@ -99,6 +107,7 @@ def main() -> None:
             graph = build_graph(
                 build_model(settings), soul=load_soul(settings.soul_file_path), checkpointer=cp,
                 history_window_messages=settings.history_window_messages,
+                **_action_context(settings),
                 context_trailing=settings.prompt_context_trailing,
             )
             reply = ask(
@@ -133,6 +142,7 @@ def main() -> None:
         graph = build_graph(
             build_model(settings), soul=load_soul(settings.soul_file_path),
             history_window_messages=settings.history_window_messages,
+            **_action_context(settings),
                 context_trailing=settings.prompt_context_trailing,
         )
         results, summary = run_eval(LocalGraphTarget(graph), cases, Judge.from_settings(settings))
@@ -203,8 +213,9 @@ def main() -> None:
             health_probe_for,
             turn_recorder_for,
         )
-        from aerys_v2.kael_line import family_notes_fn_for, kael_note_for
-        from aerys_v2.service import ask
+        from aerys_v2.kael_line import family_notes_fn_for, kael_note_for, parse_room_devices
+        from aerys_v2.tickets import start_tickets, ticket_door_for
+        from aerys_v2.service import ask, text_one_loop_flag
         from aerys_v2.services.a2a_memory import a2a_memory_writer_for
         from aerys_v2.transports.http_api import build_app
 
@@ -249,6 +260,7 @@ def main() -> None:
                 soul=soul,
                 checkpointer=cp,
                 history_window_messages=settings.history_window_messages,
+                **_action_context(settings),
                 context_trailing=settings.prompt_context_trailing,
                 # long-term memory context: ON only when MEMORIES_DATABASE_URL is
                 # set (read-only prod aerys DB); None keeps the graph memory-free
@@ -264,13 +276,17 @@ def main() -> None:
             # EMBEDDINGS_API_KEY (media) is set (the api key the router/tool
             # model needs is structurally required by Settings). None = ask()
             # runs chat-only, exactly as before tools existed.
+            from aerys_v2.kael_line import reach_desk_for
+
+            reach_desk = reach_desk_for(settings, graph)
             router = action_graph = guest_action_graph = None
             stack = action_stack_for(
                 settings, soul, room_context_fn=room_context,
                 portable_context_fn=portable_context)
             if stack is not None:
                 router, action_graph = stack
-                guest_action_graph = guest_action_graph_for(settings, soul, room_context_fn=room_context)
+                guest_action_graph = guest_action_graph_for(settings, soul, room_context_fn=room_context,
+                                                            reach_desk=reach_desk)
                 router, reflex = _arm_live_reflex(settings, reflex, router, action_graph)
                 log.info("action stack armed | ha=%s canary=[%s] media=%s",
                          settings.ha_base_url if settings.ha_token else "(off)",
@@ -299,6 +315,17 @@ def main() -> None:
                 log.info("spoken follow-ups armed | default_entity=%s satellites=%d skip<=%.1fs confirm_writes=%s",
                          settings.ha_announce_entity, len(satellite_map),
                          settings.voice_followup_skip_s, settings.voice_confirm_writes)
+            # The Kael line's return direction (task #66) and its tickets (board #176)
+            # share one note injector; the wake lets an answer reach the owner now.
+            # The reach-out desk (board #176, Stage 2): everything she starts herself goes
+            # through it: the Kael-note turn and the ticket answers here, its watcher below.
+            kael_note_fn = kael_note_for(graph, settings, desk=reach_desk)
+            # Her home body's "I'm done" (board #176, Stage 3): the /home-notice receiver
+            # writes each notice down; its worker (started below) tells the owner via the desk.
+            from aerys_v2.home_notices import home_notices_for, start_home_notices
+
+            home_notices = home_notices_for(settings, reach_desk)
+            ticket_wake = threading.Event()
             app = build_app(
                 lambda text, identity, thread: ask(
                     graph, text, identity=identity, thread_id=thread,
@@ -315,6 +342,7 @@ def main() -> None:
                     face_push=face_push,
                     drop_unaddressed=settings.voice_drop_unaddressed,
                     drop_conversation_window_s=settings.voice_drop_conversation_window_s,
+                    text_one_loop=text_one_loop_flag(settings),
                 ),
                 settings.api_token.get_secret_value(),
                 # authed HTTP callers ARE the owner when configured — voice-Chris
@@ -326,12 +354,20 @@ def main() -> None:
                 health_probe=health_probe_for(cp),
                 # The Kael line's return direction (task #66): his replies land
                 # in the thread she pinged from, receipted in v2_kael_notes.
-                kael_note_fn=kael_note_for(graph, settings),
+                kael_note_fn=kael_note_fn,
+                # Kael tickets (board #176): he answers by ticket; the watcher below
+                # brings answers to the owner, woken early by each answer.
+                kael_tickets=ticket_door_for(settings, kael_note_fn, ticket_wake),
+                home_notice_fn=home_notices.receive if home_notices is not None else None,
+                home_webhook_token=(settings.home_webhook_token.get_secret_value()
+                                    if settings.home_webhook_token is not None else None),
                 # Gap #37: kael:* exchanges leave a durable memory (family
                 # memory door 1 — the only door approved to build solo).
                 a2a_memory_fn=a2a_memory_writer_for(settings),
                 # Office satellite speaks through Leviathan (owner ask 2026-09-26).
                 speaker_redirect=speaker_redirect_for(settings),
+                # A satellite speaking through its own speaker: the button stops her there (11/14).
+                satellite_voice=satellite_voice_for(settings),
                 settings=settings,  # speaker ID: voice_speaker_persons / unknown policy
             )
             # ASK_ONCE=<path to an /ask JSON body>: serve that one request through this
@@ -345,6 +381,9 @@ def main() -> None:
                 from aerys_v2.transports.http_api import serve_once
 
                 sys.exit(serve_once(app, ask_once, settings.api_token.get_secret_value()))
+            from aerys_v2.dj import start_dj
+
+            start_dj(settings, graph, action_graph, tier_models["fast"], soul)
             # Her circadian rhythm: ONE watcher, in --serve only (the other
             # transports must not fight over her eyelids). Daemon thread;
             # None unless panel + HA + occupancy entity are all configured.
@@ -358,7 +397,7 @@ def main() -> None:
             # --serve-only doctrine as the presence watcher.
             from aerys_v2.storm_watch import start_storm_watch
 
-            if start_storm_watch(settings) is not None:
+            if start_storm_watch(settings, desk=reach_desk) is not None:
                 log.info("storm watch armed | alerts=10m outlook=6h")
             # Kael check-ins (owner ask 2026-10-12): the recurring jobs that tap Kael.
             # Same one-daemon, --serve-only doctrine: the transports must not each tap.
@@ -366,6 +405,65 @@ def main() -> None:
 
             if start_checkins(settings) is not None:
                 log.info("kael check-ins armed | every 60s")
+            # Kael tickets (board #176): resend, remind Kael, tell the owner, relay answers.
+            if start_tickets(settings, graph, ticket_wake, desk=reach_desk) is not None:
+                log.info("kael tickets armed | every 60s")
+            from aerys_v2.reach import start_reach_desk
+
+            if start_reach_desk(reach_desk) is not None:
+                log.info("reach-out desk armed | budget %s, rooms with a speaker: %d",
+                         settings.reach_daily_budget, len(parse_room_devices(settings.reach_room_devices)))
+            # Her morning brief (board #176): spoken in the office the first time the house
+            # places him there after he's up. Off unless MORNING_BRIEF is set.
+            from aerys_v2.brief import (evening_heads_up_for, morning_brief_for, start_evening_heads_up,
+                                        start_morning_brief)
+
+            morning_brief = morning_brief_for(settings, reach_desk, action_graph=action_graph)
+            start_morning_brief(morning_brief)
+            # Her evening heads-up: tomorrow, briefly, only when tomorrow earns it. Off unless
+            # EVENING_HEADS_UP is set.
+            start_evening_heads_up(evening_heads_up_for(settings, reach_desk, action_graph=action_graph))
+            # Her welcome-home hello (board #178): after 30+ minutes out, in the room he settles
+            # in; it carries the morning brief when that's still due. Off unless WELCOME_HOME is set.
+            from aerys_v2.welcome import start_welcome_home, welcome_home_for
+
+            start_welcome_home(welcome_home_for(settings, reach_desk, brief=morning_brief, action_graph=action_graph))
+            # Follow-ups: check-backs he said yes to, and a few unasked check-ins. Off unless
+            # FOLLOWUPS is set; the plan miner runs in shadow until promoted.
+            from aerys_v2.followups import followups_for, start_followups
+
+            start_followups(followups_for(settings, reach_desk))
+            # Her own wake-ups (D40/D41): what she set herself to check later runs here, one
+            # unattended action turn each on the wake graph, results through the desk. Off unless
+            # WAKEUPS is set.
+            from aerys_v2.wakeups import start_wakeups, wakeups_for
+
+            start_wakeups(wakeups_for(settings, reach_desk, action_graph=action_graph))
+            start_home_notices(home_notices)
+            # Her long jobs at home (s3-02): a job he approved by button is started by this one
+            # watcher (the other transports only ask), and she's told in her thread how it went.
+            hands_watcher = getattr(action_graph, "hands_watcher", None)
+            if hands_watcher is not None:
+                hands_watcher.note = kael_note_fn
+                if reach_desk is not None:
+                    # 11/19: a failure after his Approve reaches HIM too, once, as quiet text (owed: never
+                    # dropped or budgeted; text only: never spoken). Queued only, never delivered here: the
+                    # desk's own tick delivers it (Codex 11/19: delivering from this thread would wait on the
+                    # desk's lock), and add_new keeps one row per key, ever, so a re-offer after a restart
+                    # is a no-op.
+                    from datetime import datetime as _dt, timezone as _tz
+
+                    from aerys_v2.reach import ReachEvent
+
+                    def _owner_notice(key, text, _desk=reach_desk):
+                        now = _dt.now(_tz.utc)
+                        _desk.store.add_new(ReachEvent(source="approvals", topic="approvals", headline=text,
+                                                       urgency="timely", owed=True, text_only=True, dedupe_key=key),
+                                            now, status="queued", reason="a failure after his Approve",
+                                            not_before=now)
+
+                    hands_watcher.owner_notice = _owner_notice
+                hands_watcher.start()
             uvicorn.run(app, host="0.0.0.0", port=settings.api_port, log_level="info")
         sys.exit(0)
 
@@ -392,13 +490,14 @@ def main() -> None:
             deep_gate_for,
             load_soul,
             room_names_for,
+            owner_room_names_for,
             portable_context_fn_for,
             room_context_fn_for,
             tier_models_for,
             face_pusher_for,
             turn_recorder_for,
         )
-        from aerys_v2.service import ask
+        from aerys_v2.service import ask, text_one_loop_flag
         from aerys_v2.services.live_room import LiveRoomReader
         from aerys_v2.transports.discord_gateway import AerysDiscordClient, parse_sealed_dm_users
 
@@ -427,21 +526,34 @@ def main() -> None:
         # His own un-addressed messages must read as HIM, not as his Discord handle:
         # the live read is the one path that skips identity resolution (2026-09-14).
         room_context = LiveRoomReader(fallback=room_context_fn_for(settings),
-                                      speaker_names=room_names_for(settings))
+                                      speaker_names=room_names_for(settings),
+                                      owner_ids=owner_room_names_for(settings))
         # Board #12: her portable turns, read back into the house body, so
         # "1 identity, 1 memory" holds in BOTH directions.
         portable_context = portable_context_fn_for(settings)
         reflex = reflex_for(settings)
         content_privacy = privacy_shadow_for(settings, content_privacy_fn_for(settings), reflex)
+        from aerys_v2.tools.pass_to_chris import relay_queue_for, relay_for
+        from aerys_v2.tools.report_to_kael import guest_report_overlay
+        relay_desk = relay_queue_for(settings)
+        contact_relay = relay_for(settings, relay_desk)
+
+        def contact_overlay(config):
+            conf = (config or {}).get('configurable') or {}
+            text = guest_report_overlay(contact_relay, conf.get('identity') or {}, conf.get('thread_id', ''))
+            return text + "\n" if text else ""
+
         graph = build_graph(
             build_model(settings), soul=soul, checkpointer=cp,
             history_window_messages=settings.history_window_messages,
+            **_action_context(settings),
                 context_trailing=settings.prompt_context_trailing,
             # long-term memory context: same wiring as --serve so Discord text
             # chats recall memory too. None when MEMORIES_DATABASE_URL is unset
             # (degrade-safe: memory-free graph on DB-less boxes).
             context_fn=context_fn_for(settings),
             tier_models=tier_models_for(settings),
+            guest_overlay_fn=contact_overlay,
             room_context_fn=room_context,
             portable_context_fn=portable_context,
         )
@@ -451,13 +563,16 @@ def main() -> None:
         record_turn = turn_recorder_for(settings)
         # Panel-face seam: text turns move her desk face too (working/mood).
         face_push = face_pusher_for(settings)
+        # Discord contacts use this local guest graph, not the HTTP action graph.
+        # The shared reach ledger is drained by the existing --serve desk watcher.
         router = action_graph = guest_action_graph = None
         stack = action_stack_for(
             settings, soul, room_context_fn=room_context,
             portable_context_fn=portable_context)
         if stack is not None:
             router, action_graph = stack
-            guest_action_graph = guest_action_graph_for(settings, soul, room_context_fn=room_context)
+            guest_action_graph = guest_action_graph_for(settings, soul, room_context_fn=room_context,
+                                                        reach_desk=relay_desk)
             router, reflex = _arm_live_reflex(settings, reflex, router, action_graph)
 
         # Identity resolution — the AUTH BOUNDARY (transports/resolver.py). With the
@@ -495,6 +610,8 @@ def main() -> None:
                 record_turn=record_turn,
                 content_privacy_classifier=content_privacy, reflex=reflex,
                 face_push=face_push,
+                # D79: one her for household DMs (off unless TEXT_ONE_LOOP / its file says on).
+                text_one_loop=text_one_loop_flag(settings),
             ),
             resolve_fn=resolve,
             allowed_guild_id=settings.discord_guild_id,
@@ -529,6 +646,17 @@ def main() -> None:
                 telegram_notify=telegram_notify_for(settings),
             )
             log.info("slash commands attached (guild %s)", settings.discord_guild_id)
+        # The owner's approval button (approvals.py): this gateway posts it to his DMs and
+        # records his tap. Off unless APPROVALS is set and there's a database, an owner, and the
+        # HA notification leg (approvals_for says which).
+        if settings.approvals:
+            from aerys_v2.approvals import approvals_for, attach_approvals, owner_id_for
+
+            asking = approvals_for(settings)
+            if asking is not None:
+                attach_approvals(client, store=asking.store, owner_id=owner_id_for(settings),
+                                 notify=asking.notify)
+                log.info("approval buttons attached")
         # The room reader needs the gateway that did not exist when the graph was
         # built; until this line it quietly answers from the turns table.
         room_context.attach(client)
@@ -565,7 +693,7 @@ def main() -> None:
             face_pusher_for,
             turn_recorder_for,
         )
-        from aerys_v2.service import ask
+        from aerys_v2.service import ask, text_one_loop_flag
         from aerys_v2.transports.telegram_gateway import AerysTelegramClient
 
         # [01-05 PHOENIX] same degrade-safe arming as --serve/--discord: this
@@ -592,6 +720,7 @@ def main() -> None:
         graph = build_graph(
             build_model(settings), soul=soul, checkpointer=cp,
             history_window_messages=settings.history_window_messages,
+            **_action_context(settings),
                 context_trailing=settings.prompt_context_trailing,
             # long-term memory context: same wiring as --serve/--discord so
             # Telegram text chats recall memory too. None when
@@ -646,6 +775,8 @@ def main() -> None:
                 record_turn=record_turn,
                 content_privacy_classifier=content_privacy, reflex=reflex,
                 face_push=face_push,
+                # D79: one her for household DMs (off unless TEXT_ONE_LOOP / its file says on).
+                text_one_loop=text_one_loop_flag(settings),
             ),
             resolve_fn=resolve,
             allowed_chat_ids=chat_ids,

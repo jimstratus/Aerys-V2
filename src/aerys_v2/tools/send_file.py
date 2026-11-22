@@ -1,0 +1,474 @@
+"""She hands him a file her home job made (#183, the owner's ruling 11/10).
+
+Her home body (her own VM) writes files in her workspace there. On 11/10 a how-to her home job
+wrote for him never reached him: she couldn't attach a file in his DM. send_file_to_chris reads
+the file from her home server (GET {home_url}/files/{path}, the home server's own token) and sends
+it to him alone: a Discord attachment in his DM, or a Telegram document when he asked on Telegram.
+
+It only ever goes to him, so it isn't messaging other people (the owner's 11/08 line), and it needs
+no tap. Honest by construction: SENT only after Discord or Telegram took the file; anything else is
+a plain NOT SENT that says why. Only he is offered the tool (send_file_middleware), and a call from
+anyone else is refused anyway. The file's contents are never logged.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import posixpath
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Callable
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+
+from aerys_v2.state import identity_from_config
+
+log = logging.getLogger(__name__)
+
+TOOL_NAME = "send_file_to_chris"
+SENT_TOOL_NAME = "files_sent_to_chris"
+#: The same file to him again within this window needs him to ask again (#187, 11/10).
+RESEND_HOURS = 12
+EASTERN = ZoneInfo("America/New_York")
+#: The home server refuses more (413); a bot's Discord upload limit is above it.
+MAX_BYTES = 8 * 1024 * 1024
+#: Her workspace on her home machine: absolute paths inside it are sent as relative ones.
+HOME_WORKSPACE = "/home/hands/work"
+NOTE_CHARS = 900
+NAME_CHARS = 120
+DISCORD_API = "https://discord.com/api/v10"
+USER_AGENT = "DiscordBot (aerys-files, 1.0)"   # the default UA gets 403 from Discord (kael_line)
+
+Deliver = Callable[[str, str, bytes, str], None]
+
+
+def _relative(path) -> str:
+    """The path as her home server takes it: relative to her workspace, and canonical, so
+    'report.md', './report.md' and 'notes/../report.md' are one file to the record too (Codex
+    review, #187). A path that climbs out of the workspace comes back starting with '..'."""
+    p = str(path or "").strip()
+    for prefix in (HOME_WORKSPACE + "/", "~/work/"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+    p = p.lstrip("/")
+    return "" if not p else ("" if (n := posixpath.normpath(p)) == "." else n)
+
+
+def _name(header, rel: str) -> str:
+    """A file name, only ever a name: whatever the header says, no directories."""
+    name = posixpath.basename(str(header or "").replace("\\", "/").strip()) or posixpath.basename(rel)
+    return (name or "file")[:NAME_CHARS]
+
+
+@dataclass(frozen=True)
+class FileSend:
+    sent_at: datetime
+    path: str
+    name: str
+    bytes: int
+    surface: str
+
+
+class FileSends:
+    """The record of files she handed him (v2_file_sends, migration 026). In memory for tests.
+
+    claim(person, path) serializes check, delivery and record for one file, so two overlapping
+    calls can't both find no send and both deliver (Codex review, #187)."""
+
+    #: Sends kept in this process: as long as the read tool can look back (a week).
+    KEEP = timedelta(days=7)
+
+    def __init__(self):
+        self.rows: list[tuple[str, FileSend]] = []
+        self._rows_lock = threading.Lock()       # every change to rows, and every snapshot of it
+        self._locks: dict[tuple[str, str], threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def _local_lock(self, person_id: str, path: str) -> threading.Lock:
+        with self._guard:
+            return self._locks.setdefault((str(person_id), path), threading.Lock())
+
+    @contextmanager
+    def claim(self, person_id: str, path: str):
+        with self._local_lock(person_id, path):
+            yield
+
+    def _keep(self, person_id: str, send: FileSend) -> None:
+        with self._rows_lock:
+            self.rows.append((str(person_id), send))
+            cutoff = send.sent_at - self.KEEP
+            self.rows = [(p, s) for p, s in self.rows if s.sent_at >= cutoff]   # by age, never by count
+
+    def _snapshot(self) -> list[tuple[str, FileSend]]:
+        with self._rows_lock:
+            return list(self.rows)
+
+    def record(self, person_id: str, send: FileSend, thread_id: str = "") -> None:
+        self._keep(person_id, send)
+
+    def last(self, person_id: str, path: str, since: datetime) -> FileSend | None:
+        hits = [s for p, s in self._snapshot() if p == str(person_id) and s.path == path and s.sent_at >= since]
+        return max(hits, key=lambda s: s.sent_at) if hits else None
+
+    def recent(self, person_id: str, since: datetime) -> list[FileSend]:
+        return sorted((s for p, s in self._snapshot() if p == str(person_id) and s.sent_at >= since),
+                      key=lambda s: s.sent_at, reverse=True)
+
+
+class SendInProgress(Exception):
+    """Another worker is sending this file right now (its claim outlasted the wait)."""
+
+
+class RecordUnreadable(Exception):
+    """The database record couldn't be read; .local holds what this process remembers."""
+
+    def __init__(self, local: list[FileSend]):
+        super().__init__("the record of sends couldn't be read")
+        self.local = local
+
+
+class PostgresFileSends(FileSends):
+    """v2_file_sends in the brain's own database: a short connection per call, like the other ledgers.
+
+    Every send is also kept in this process (self.rows) before the database write, so a write that
+    fails doesn't make the record deny a send that happened; reads merge the two. claim() holds a
+    Postgres advisory lock across workers (Discord, Telegram and voice run in separate containers),
+    falling back to this process's lock when the database can't be reached."""
+
+    #: A lock is held across one delivery (a Discord or Telegram upload, at most about a minute).
+    LOCK_WAIT_MS = 90_000
+
+    def __init__(self, database_url: str):
+        super().__init__()
+        self.database_url = database_url
+
+    def _connect(self, options="-c statement_timeout=5000"):
+        import psycopg
+
+        return psycopg.connect(self.database_url, connect_timeout=5, options=options)
+
+    @contextmanager
+    def claim(self, person_id, path):
+        """The process lock, then the cross-worker advisory lock. A database we can't reach falls back
+        to the process lock (fail-open: he asked for the file). A lock we CAN reach but another worker
+        holds past the wait raises SendInProgress: never deliver beside a send in flight."""
+        import psycopg
+
+        with self._local_lock(person_id, path):
+            key = f"file_send:{person_id}:{path}"
+            conn = None
+            try:
+                conn = self._connect(f"-c statement_timeout=0 -c lock_timeout={self.LOCK_WAIT_MS}")
+                conn.autocommit = True
+                conn.execute("SELECT pg_advisory_lock(hashtextextended(%s, 26))", (key,))
+            except psycopg.errors.LockNotAvailable:
+                self._close(conn)
+                raise SendInProgress(path)
+            except BaseException as e:
+                self._close(conn)
+                if not isinstance(e, Exception):
+                    raise                      # an interrupt is never swallowed
+                log.warning("send_file: no cross-worker lock (%s); this process's lock only", type(e).__name__)
+                conn = None
+            try:
+                yield
+            finally:
+                if conn is not None:
+                    try:
+                        conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 26))", (key,))
+                    except Exception as e:      # the send's outcome stands; closing the session frees it
+                        log.warning("send_file: advisory unlock failed (%s)", type(e).__name__)
+                    finally:
+                        self._close(conn)
+
+    @staticmethod
+    def _close(conn) -> None:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:                  # noqa: BLE001 — cleanup only
+                pass
+
+    def record(self, person_id, send, thread_id=""):
+        self._keep(person_id, send)            # first: a failed write never erases the evidence
+        with self._connect() as c:
+            c.execute("INSERT INTO v2_file_sends (sent_at, person_id, path, name, bytes, surface, thread_id) "
+                      "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                      (send.sent_at, str(person_id), send.path, send.name, send.bytes, send.surface, thread_id or ""))
+
+    def _rows(self, sql, args):
+        with self._connect() as c:
+            return [FileSend(*row) for row in c.execute(sql, args).fetchall()]
+
+    def _merged(self, db: list[FileSend], local: list[FileSend]) -> list[FileSend]:
+        seen = {(s.path, s.sent_at) for s in db}
+        return sorted(db + [s for s in local if (s.path, s.sent_at) not in seen],
+                      key=lambda s: s.sent_at, reverse=True)
+
+    def last(self, person_id, path, since):
+        local = [s for s in [super().last(person_id, path, since)] if s is not None]
+        try:
+            rows = self._rows("SELECT sent_at, path, name, bytes, surface FROM v2_file_sends WHERE person_id = %s "
+                              "AND path = %s AND sent_at >= %s ORDER BY sent_at DESC LIMIT 1",
+                              (str(person_id), path, since))
+        except Exception as e:                 # what this process remembers still counts
+            if local:
+                log.warning("send_file: record unreadable (%s); using this process's sends", type(e).__name__)
+                return local[0]
+            raise
+        merged = self._merged(rows, local)
+        return merged[0] if merged else None
+
+    def recent(self, person_id, since):
+        local = super().recent(person_id, since)
+        try:
+            rows = self._rows("SELECT sent_at, path, name, bytes, surface FROM v2_file_sends WHERE person_id = %s "
+                              "AND sent_at >= %s ORDER BY sent_at DESC LIMIT 50", (str(person_id), since))
+        except Exception as e:
+            raise RecordUnreadable(local) from e
+        return self._merged(rows, local)
+
+
+def _when(at: datetime, now: datetime) -> str:
+    """'10:14 PM today' / '10:14 PM Mon Nov 9', in the house's time."""
+    local, today = at.astimezone(EASTERN), now.astimezone(EASTERN).date()
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{clock} today" if local.date() == today else f"{clock} {local.strftime('%a %b')} {local.day}"
+
+
+def _where(surface: str) -> str:
+    return "his Telegram chat" if surface == "telegram" else "his Discord DM"
+
+
+def build_send_file_tool(*, home_url: str, home_token: str, owner_person_id: str, deliver: Deliver,
+                         get: Callable | None = None, ledger: FileSends | None = None,
+                         now: Callable[[], datetime] | None = None):
+    """The tool, closed over her home server and a delivery leg. get(url, headers) and now() are the
+    test seams. ledger: the record of sends (#187); None keeps no record and guards nothing."""
+    import httpx
+
+    base = str(home_url).rstrip("/")
+    headers = {"Authorization": f"Bearer {home_token}"}
+    fetch = get or (lambda url, hdrs: httpx.get(url, headers=hdrs, timeout=30.0))
+    clock = now or (lambda: datetime.now(timezone.utc))
+
+    @tool(TOOL_NAME)
+    def send_file_to_chris(path: str, config: RunnableConfig, note: str = "", again: bool = False) -> str:
+        """Send Chris a file from your home machine: it lands in his DM, as a file he can open.
+
+        CALL THIS when he wants a file your home job made (a write-up, a page, an export, an
+        image): "send it to me", "can I have the file", "put it in my DM". The file must be in
+        your home workspace; use the path your home job reported (absolute or relative to the
+        workspace). It goes to him alone, on the surface he asked from (Telegram if he asked on
+        Telegram, else his Discord DM), up to 8 MB. If he asks what you sent him, that's
+        files_sent_to_chris, not this.
+
+        path: the file's path in your home workspace. Required.
+        note: a short line to send with it (optional).
+        again: true ONLY when he asked you to send a file you already sent ("send it again").
+
+        Returns SENT once he has it, ALREADY SENT when it went to him recently, or NOT SENT and
+        why; never say he has it otherwise.
+        """
+        identity = identity_from_config(config)
+        if str(identity.get("user_id") or "") != str(owner_person_id):
+            return "NOT SENT: files from her home machine go only to Chris, when he asks."
+        if identity.get("unattended"):
+            # A wake-up (D40) reaches him only through the desk, which keeps his quiet hours.
+            return "NOT SENT: from a wake-up, say where the file is in what you tell him; he can ask for it."
+        rel = _relative(path)
+        if not rel:
+            return "NOT SENT: say which file: its path in your home workspace."
+        if rel == ".." or rel.startswith("../"):
+            return "NOT SENT: that path leaves my home workspace; only files inside it can be sent."
+        if ledger is None:
+            return _send(rel, identity, config, note, again)
+        # One file at a time: the check, the delivery and the record happen under one claim.
+        try:
+            with ledger.claim(owner_person_id, rel):
+                return _send(rel, identity, config, note, again)
+        except SendInProgress:
+            return ("NOT SENT: this same file is being sent to him right now by another part of me. Give it a "
+                    "minute, then check files_sent_to_chris before sending it again.")
+
+    def _send(rel: str, identity: dict, config, note: str, again: bool) -> str:
+        if ledger is not None and not again:
+            try:
+                prev = ledger.last(owner_person_id, rel, clock() - timedelta(hours=RESEND_HOURS))
+            except Exception as e:       # a record we can't read never blocks a send he asked for
+                log.warning("send_file: couldn't read the record of sends (%s)", type(e).__name__)
+                prev = None
+            if prev is not None:
+                return (f"ALREADY SENT: {prev.name} ({prev.bytes} bytes) went to {_where(prev.surface)} at "
+                        f"{_when(prev.sent_at, clock())}. It's there; don't send it again unless he asks you "
+                        "to send it again (then call with again=true).")
+        try:
+            r = fetch(f"{base}/files/{quote(rel, safe='/')}", headers)
+        except Exception as e:
+            log.warning("send_file: home machine unreachable (%s)", type(e).__name__)
+            return f"NOT SENT: I couldn't reach my home machine ({type(e).__name__}); try again in a moment."
+        if r.status_code == 404:
+            return f"NOT SENT: there's no file at {rel} in my home workspace (check the path my job reported)."
+        if r.status_code == 413:
+            return "NOT SENT: that file is over 8 MB, too big to send in a message."
+        if r.status_code in (401, 403):
+            return "NOT SENT: my home machine refused the request (its key didn't match)."
+        if r.status_code != 200:
+            return f"NOT SENT: my home machine answered HTTP {r.status_code}."
+        data = bytes(r.content or b"")
+        if len(data) > MAX_BYTES:
+            return "NOT SENT: that file is over 8 MB, too big to send in a message."
+        name = _name((r.headers or {}).get("X-File-Name"), rel)
+        surface = "telegram" if str(identity.get("platform") or "").strip().lower() == "telegram" else "discord"
+        try:
+            deliver(surface, name, data, " ".join(str(note or "").split())[:NOTE_CHARS])
+        except Exception as e:
+            log.warning("send_file: %s didn't take the file (%s)", surface, type(e).__name__)
+            return (f"NOT SENT: I got the file from my home machine, but {surface.title()} wouldn't take it "
+                    f"({type(e).__name__}).")
+        log.info("send_file: a file went to him on %s (%d bytes)", surface, len(data))
+        if ledger is not None:
+            try:
+                thread = str(((config or {}).get("configurable") or {}).get("thread_id") or "")
+                ledger.record(owner_person_id, FileSend(clock(), rel, name, len(data), surface), thread)
+            except Exception as e:       # he has the file either way; only the record is missing
+                log.warning("send_file: sent, but the record of it failed (%s)", type(e).__name__)
+        return f"SENT: {name} ({len(data)} bytes) is in {_where(surface)}."
+
+    return send_file_to_chris
+
+
+def build_files_sent_tool(*, ledger: FileSends, owner_person_id: str,
+                          now: Callable[[], datetime] | None = None):
+    """What she handed him, from the record (#187): the evidence for 'what did you send me?'."""
+    clock = now or (lambda: datetime.now(timezone.utc))
+
+    @tool(SENT_TOOL_NAME)
+    def files_sent_to_chris(config: RunnableConfig, hours: int = 48) -> str:
+        """The files you've sent Chris, newest first: when, what, and where it went.
+
+        CALL THIS when he asks what you sent him, whether a file reached him, or when. Files
+        send_file_to_chris delivered are recorded here (the record began Nov 10, 2026). Answer
+        from it; don't send a file again because he asked about it. A file missing from the
+        record is NOT proof it didn't go: never tell him it wasn't sent, and never send it again,
+        because of a missing line.
+
+        hours: how far back to look (default 48, at most a week).
+        """
+        identity = identity_from_config(config)
+        if str(identity.get("user_id") or "") != str(owner_person_id):
+            return "The record of files sent to Chris is only for Chris."
+        span = max(1, min(int(hours or 48), 168))
+        partial = ""
+        try:
+            sends = ledger.recent(owner_person_id, clock() - timedelta(hours=span))
+        except RecordUnreadable as e:
+            log.warning("files_sent: couldn't read the record (%s)", type(e.__cause__).__name__)
+            if not e.local:
+                return "I couldn't read the record of files I sent just now; I don't know, so I won't guess."
+            sends = e.local
+            partial = ("\n(The full record couldn't be read just now; these are only the sends this part of me "
+                       "remembers. There may be others.)")
+        except Exception as e:
+            log.warning("files_sent: couldn't read the record (%s)", type(e).__name__)
+            return "I couldn't read the record of files I sent just now; I don't know, so I won't guess."
+        if not sends:
+            return (f"No recorded sends to Chris in the last {span} hours. The record isn't proof a file "
+                    "didn't go: if he says he has one, believe him; don't send it again unless he asks.")
+        lines = [f"- {_when(s.sent_at, clock())}: {s.name} ({s.bytes} bytes), {s.path}, to {_where(s.surface)}"
+                 for s in sends]
+        return f"Files sent to Chris in the last {span} hours, newest first:\n" + "\n".join(lines) + partial
+
+    return files_sent_to_chris
+
+
+def deliver_for(settings, *, post: Callable | None = None,
+                owner_id: Callable[[str], str | None] | None = None) -> Deliver | None:
+    """deliver(surface, name, data, note) over her own bots: Discord (a DM attachment) and Telegram
+    (a document). None when neither bot is configured. Raises when the surface can't be reached
+    (no bot, no id for him there, a refused upload); the tool turns that into NOT SENT.
+    post(url, **httpx_kwargs) and owner_id(platform) are the test seams."""
+    discord = getattr(settings, "discord_bot_token", None)
+    telegram = getattr(settings, "telegram_bot_token", None)
+    if discord is None and telegram is None:
+        return None
+    import httpx
+
+    send = post or (lambda url, **kw: httpx.post(url, timeout=60.0, **kw))
+    if owner_id is None:
+        from aerys_v2.kael_line import _owner_platform_id
+
+        owner_id = lambda platform: _owner_platform_id(settings, platform)    # noqa: E731
+
+    def ok(r, what: str):
+        if not 200 <= r.status_code < 300:
+            raise RuntimeError(f"{what} answered HTTP {r.status_code}")
+        return r
+
+    def to_discord(name: str, data: bytes, note: str) -> None:
+        if discord is None:
+            raise RuntimeError("no Discord bot")
+        user = owner_id("discord")
+        if not user:
+            raise RuntimeError("no Discord id for him")
+        hdrs = {"Authorization": f"Bot {discord.get_secret_value()}", "User-Agent": USER_AGENT}
+        dm = ok(send(f"{DISCORD_API}/users/@me/channels", headers={**hdrs, "Content-Type": "application/json"},
+                     content=json.dumps({"recipient_id": user})), "Discord")
+        channel = json.loads(dm.content)["id"]
+        payload = {"content": note, "attachments": [{"id": 0, "filename": name}]}
+        ok(send(f"{DISCORD_API}/channels/{channel}/messages", headers=hdrs,
+                data={"payload_json": json.dumps(payload)},
+                files={"files[0]": (name, data, "application/octet-stream")}), "Discord")
+
+    def to_telegram(name: str, data: bytes, note: str) -> None:
+        if telegram is None:
+            raise RuntimeError("no Telegram bot")
+        chat = owner_id("telegram")
+        if not chat:
+            raise RuntimeError("no Telegram id for him")
+        ok(send(f"https://api.telegram.org/bot{telegram.get_secret_value()}/sendDocument",
+                data={"chat_id": chat, "caption": note}, files={"document": (name, data)}), "Telegram")
+
+    def deliver(surface: str, name: str, data: bytes, note: str) -> None:
+        (to_telegram if surface == "telegram" else to_discord)(name, data, note)
+
+    return deliver
+
+
+def send_file_middleware(file_tool, owner_person_id: str, sent_tool=None):
+    """Mounts the tools for him only: anyone else's model call doesn't see them (and a call from
+    anyone else is refused in the tools too). sent_tool: files_sent_to_chris, the record (#187)."""
+    from langchain.agents.middleware import AgentMiddleware
+    from langgraph.config import get_config
+
+    mine = [file_tool] + ([sent_tool] if sent_tool is not None else [])
+    names = {getattr(t, "name", None) for t in mine}
+
+    def his(request) -> bool:
+        try:
+            config = get_config()
+        except RuntimeError:          # not inside a run: nobody to offer it to
+            return False
+        return str(identity_from_config(config).get("user_id") or "") == str(owner_person_id)
+
+    def offered(request):
+        if his(request):
+            return request
+        return request.override(tools=[t for t in (request.tools or []) if getattr(t, "name", None) not in names])
+
+    class SendFile(AgentMiddleware):
+        tools = mine
+
+        def wrap_model_call(self, request, handler):
+            return handler(offered(request))
+
+        async def awrap_model_call(self, request, handler):
+            return await handler(offered(request))
+
+    return SendFile()

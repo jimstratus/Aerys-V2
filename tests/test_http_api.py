@@ -84,6 +84,7 @@ def test_ask_round_trip_with_defaults():
     assert r.json() == {
         "reply": "echo:hello|Chris (HTTP)|http:default",
         "thread_id": "http:default",
+        "keep_listening": False,
     }
 
 
@@ -168,7 +169,7 @@ def test_gaps_without_reader_is_honest_not_error():
 def _settings_with_speakers(**kw):
     from aerys_v2.config import Settings
     return Settings(_env_file=None, anthropic_api_key="x", owner_person_id="11111111-1111-1111-1111-111111111111",
-                    voice_speaker_persons="chris=11111111-1111-1111-1111-111111111111,megan=22222222-2222-2222-2222-222222222222", **kw)
+                    voice_speaker_persons="chris=11111111-1111-1111-1111-111111111111,robin=22222222-2222-2222-2222-222222222222", **kw)
 
 
 def _speaker_app(**kw):
@@ -191,8 +192,8 @@ def test_untagged_voice_turn_stays_the_owners():
 def test_owner_tag_is_a_no_op_and_enrolled_family_gets_their_own_person_thread():
     r = _ask(_speaker_app(), {"id": "chris", "confidence": 0.8})
     assert r["thread_id"] == "person:11111111-1111-1111-1111-111111111111" and "|Chris (Voice)|" in r["reply"]
-    r = _ask(_speaker_app(), {"id": "Megan", "confidence": 0.7})
-    assert r["thread_id"] == "person:22222222-2222-2222-2222-222222222222" and "|Megan (Voice)|" in r["reply"]
+    r = _ask(_speaker_app(), {"id": "Robin", "confidence": 0.7})
+    assert r["thread_id"] == "person:22222222-2222-2222-2222-222222222222" and "|Robin (Voice)|" in r["reply"]
 
 
 def test_unknown_or_unlisted_or_low_confidence_speaker_is_a_guest_turn():
@@ -200,9 +201,9 @@ def test_unknown_or_unlisted_or_low_confidence_speaker_is_a_guest_turn():
     # while his own worst live turn was 0.44 (see the uncertainty-band test below).
     for tag in ({"id": "unknown", "confidence": 0.1}, {"id": "dimitri", "confidence": 0.9}):
         r = _ask(_speaker_app(), tag)
-        assert r["thread_id"] == "person:voice-guest" and "|Guest (Voice)|" in r["reply"], tag
-    r = _ask(_speaker_app(voice_speaker_min_confidence=0.75), {"id": "megan", "confidence": 0.6})
-    assert r["thread_id"] == "person:voice-guest"
+        assert r["thread_id"].startswith("person:voice-guest:") and "|Guest (Voice)|" in r["reply"], tag
+    r = _ask(_speaker_app(voice_speaker_min_confidence=0.75), {"id": "robin", "confidence": 0.6})
+    assert r["thread_id"].startswith("person:voice-guest:")
 
 
 def test_unknown_speaker_stays_the_owner_when_configured_so():
@@ -212,15 +213,15 @@ def test_unknown_speaker_stays_the_owner_when_configured_so():
 
 def test_speaker_tag_never_moves_a_text_turn():
     c = _speaker_app()
-    r = c.post("/ask", json={"text": "hi", "thread_id": "http:default", "speaker": {"id": "megan", "confidence": 0.9}},
+    r = c.post("/ask", json={"text": "hi", "thread_id": "http:default", "speaker": {"id": "robin", "confidence": 0.9}},
                headers={"Authorization": "Bearer sekrit"}).json()
     assert r["thread_id"] == "http:default"
 
 
 def test_speaker_person_map_parses_and_skips_junk():
     from aerys_v2.config import Settings, speaker_person_map
-    s = Settings(_env_file=None, anthropic_api_key="x", voice_speaker_persons=" Chris = a , megan=b, broken, =c, d= ")
-    assert speaker_person_map(s) == {"chris": "a", "megan": "b"}
+    s = Settings(_env_file=None, anthropic_api_key="x", voice_speaker_persons=" Chris = a , robin=b, broken, =c, d= ")
+    assert speaker_person_map(s) == {"chris": "a", "robin": "b"}
 
 
 def test_an_uncertain_match_does_not_demote_the_owner_to_a_guest():
@@ -235,12 +236,12 @@ def test_an_uncertain_match_does_not_demote_the_owner_to_a_guest():
     r = _ask(c, {"id": "unknown", "confidence": 0.31})          # unsure → still his turn
     assert r["thread_id"] == "person:11111111-1111-1111-1111-111111111111"
     r = _ask(c, {"id": "unknown", "confidence": 0.12})          # a TV voice → guest
-    assert r["thread_id"] == "person:voice-guest"
+    assert r["thread_id"].startswith("person:voice-guest:")
     # The setting reads literally — "demote below X" — so 1.0 demotes every unknown
     # and closes the band entirely, which is the old behaviour.
     strict = TestClient(build_app(fake_ask, "sekrit", owner_person_id="11111111-1111-1111-1111-111111111111",
                                   settings=_settings_with_speakers(voice_guest_demote_below=1.0)))
-    assert _ask(strict, {"id": "unknown", "confidence": 0.31})["thread_id"] == "person:voice-guest"
+    assert _ask(strict, {"id": "unknown", "confidence": 0.31})["thread_id"].startswith("person:voice-guest:")
 
 
 def test_the_gate_reads_the_doors_demotion_flag_not_the_raw_id():
@@ -271,3 +272,25 @@ def test_voice_reply_from_a_redirected_satellite_is_also_played_on_the_desk():
     c.post("/ask", json={"text": "what time is it", "thread_id": "voice:beta", "device_id": "office-dev"}, headers=auth)
     c.post("/ask", json={"text": "typed, not spoken", "thread_id": "t1", "device_id": "office-dev"}, headers=auth)
     assert len(said) == 1 and said[0][0] == "office-dev"      # voice turns only
+
+
+
+def test_t17_a_guest_conversation_is_a_session_per_device_and_resets_after_quiet():
+    """T-17 (11/13): a 2 AM stray on the shared guest thread answered his 'Thank you' eight hours later."""
+    from aerys_v2.transports.http_api import GUEST_SESSION_IDLE_S
+    now = {"t": 1000.0}
+    c = TestClient(build_app(fake_ask, "sekrit", owner_person_id="11111111-1111-1111-1111-111111111111",
+                             settings=_settings_with_speakers(), guest_clock=lambda: now["t"]))
+
+    def guest(device):
+        body = {"text": "hi", "thread_id": "voice:beta", "voice": True, "display_name": "x",
+                "device_id": device, "speaker": {"id": "unknown", "confidence": 0.1}}
+        return c.post("/ask", json=body, headers={"Authorization": "Bearer sekrit"}).json()["thread_id"]
+
+    first = guest("office")
+    now["t"] += 60
+    assert guest("office") == first                         # the same conversation
+    assert guest("kitchen") != first                        # another room, another guest
+    now["t"] += GUEST_SESSION_IDLE_S + 1
+    later = guest("office")
+    assert later != first and later.startswith("person:voice-guest:office:")

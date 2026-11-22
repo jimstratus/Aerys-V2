@@ -38,6 +38,8 @@ from typing import Callable
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from aerys_v2.house_names import NAMES, HouseNames
+
 log = logging.getLogger(__name__)
 
 # Haiku at temperature 0: the decision must be deterministic and as fast as the
@@ -156,6 +158,15 @@ _SEARCH_MARKERS = (
     "menu", "open today", "near me", "where can",
 )
 
+# Cart links (D39, 2026-11-12): "put dish soap in my Amazon cart" carries none of the shopping
+# markers when the store is Amazon. Whole words and a cart-shaped phrase only: substrings would
+# catch "the cartoon", "cartridge" and "the Amazon rainforest" and override "unaddressed".
+_CART_ASK = re.compile(
+    r"\b(?:in|into|to|onto)\s+(?:my|the|his|our)\s+(?:(?:amazon|walmart)\s+)?cart\b"
+    r"|\b(?:amazon|walmart)\s+cart\b",
+    re.IGNORECASE,
+)
+
 # Email / gap-logging shapes for the degraded path — the 2026-07-11 additions.
 # Same over-trigger-toward-action bias: a needless action hop costs a tool
 # refusal, while a chat route here either hallucinates mail she never read or
@@ -212,6 +223,20 @@ _KAEL_MARKERS = tuple(
     for phrase in ("let {name} know", "{name} know", "for {name}", "to {name}")
 ) + ("let kale know",)   # explicit enough to be safe even for the vegetable
 
+# Pass-on shapes (D33, 2026-11-12): her relay for a listed contact ("tell Chris ...") shipped with
+# no router vocabulary, and "please tell Chris I love him" routed to chat, where she said she
+# couldn't. This file's law again: a tool the router can't route to does not exist.
+# REQUEST shapes only (Codex review, 11/12): "I'll tell him later" and a quoted "tell him I said hi" are
+# not asks, and as plain substrings they turned owner chat into action and fed the claim gate.
+_PASS_ON_QUOTED = re.compile(r'["\u201c][^"\u201d]*["\u201d]')
+_PASS_ON_ASK = re.compile(
+    r"(?:^|[.!?]\s+|\b(?:please|pls|can you|could you|would you|will you|go ahead and)\s+)"
+    r"(?:tell|let|message|text)\s+(?:chris|him)\b"
+    r"|\bpass\s+(?:this|it|that)\s+(?:on|along)\b|\bpass\s+(?:on|along)\s+to\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_TAIL = re.compile(r"\b(?:i|i'll|i will|i'd|i can|i'm going to|we'll|we will)\s+$", re.IGNORECASE)
+
 # Music shapes for the degraded path — the 2026-07-18 addition (the music tool's
 # wiring, same day it shipped: a tool the router can't route to does not exist).
 # Same over-trigger-toward-action bias: a needless action hop costs a tool
@@ -266,7 +291,8 @@ decide which path handles it:
   SHOPPING AND AVAILABILITY are "action" too, and they are the easy ones to
   miss because they sound like small talk: what a store sells or stocks, which
   brands or products exist, what something costs, restaurant menus or hours,
-  where to buy something. "Is there a canned strawberry mimosa I can get at
+  where to buy something, and putting something in his Amazon or Walmart cart.
+  "Is there a canned strawberry mimosa I can get at
   Publix?" is "action" — naming real products you cannot verify is the same
   failure as guessing a device's state. Whenever the reply would name a
   specific brand, product, price, or storefront, choose "action".
@@ -299,6 +325,13 @@ decide which path handles it:
   Speech-to-text mangles his name constantly — "kayle", "cale", "kale",
   "kail", "cael" are all KAEL when they appear where a person's name belongs
   ("tell kale I'm running late" is a message for Kael, not about a vegetable).
+  PASSING WORDS ON is "action" too: when the user asks you to tell, message
+  or pass something on to another person (Chris included), whatever the words
+  are: "tell Chris I'll be home at 7", "let him know dinner's ready", "please
+  tell Chris I love him", "pass this on to Chris: the plumber comes at 9" are
+  ALL "action". Only the action path can deliver it; a chat answer to one
+  either claims it went or says you can't, and both are wrong. Words meant for
+  YOU are not a delivery: "Chris said to tell you hi" is "chat".
   QUOTED WORDS are not requests: when he pastes or forwards someone else's
   words ("Selyra said this: …", the text of a screenshot, a quoted message), a
   "tell her …" / "tell him …" INSIDE those words is part of what he is sharing
@@ -330,7 +363,7 @@ while the user is talking to another PERSON in the room, a TV says something
 wake-word-shaped, a conversation fragment gets captured that was never a
 request. Set "unaddressed": true when the message is clearly not directed at
 you: it DIRECTLY ADDRESSES another person by name in the second person
-("Megan, can you grab my towel?", "hang on Joe, I'll be right there"), it
+__NAMED_ADDRESS_EXAMPLE__, it
 explicitly waves you off ("no, not you"), or it is a mid-conversation
 fragment with no ask shape and no second-person address ("and then he just
 left it in the driveway"). NOTE: the system already protects live
@@ -367,6 +400,17 @@ For read-style questions the ack is a natural check-in (e.g. for "does the car
 have enough charge for Tampa?": "[warmly] Let me check her charge").
 Short and speakable — one clause. Never a generic canned phrase. For "chat"
 routes the ack is ignored; an empty string is fine there."""
+
+
+def named_address_example(names: HouseNames) -> str:
+    """The router's example of talking to someone else in the room by name. The names come from the
+    private .env (house_names.py); without them, a template that names nobody."""
+    if names.wife and names.friend:
+        return f'("{names.wife}, can you grab my towel?", "hang on {names.friend}, I\'ll be right there")'
+    return '("<name>, can you grab my towel?", "hang on <name>, I\'ll be right there")'
+
+
+_ROUTER_INSTRUCTIONS = _ROUTER_INSTRUCTIONS.replace("__NAMED_ADDRESS_EXAMPLE__", named_address_example(NAMES))
 
 
 @dataclass(frozen=True)
@@ -474,13 +518,28 @@ def plausibly_messages_kael(text: str) -> bool:
     return any(marker in lowered for marker in _KAEL_MARKERS)
 
 
+def plausibly_passes_words_on(text: str) -> bool:
+    """Degraded-path heuristic: does this text ASK her to pass words on? Quoted words don't count
+    (they're someone else's), and neither does a first-person plan ("I'll pass it on")."""
+    bare = _PASS_ON_QUOTED.sub(" ", text).strip()
+    for m in _PASS_ON_ASK.finditer(bare):
+        if not _FIRST_PERSON_TAIL.search(bare[: m.start()]):
+            return True
+    return False
+
+
+def plausibly_fills_a_cart(text: str) -> bool:
+    """Degraded-path heuristic: an ask to put something in his Amazon/Walmart cart (D39)."""
+    return bool(_CART_ASK.search(text))
+
+
 def plausibly_sets_a_timer(text: str) -> bool:
     """Degraded-path heuristic: a timer/alarm/reminder ask."""
     lowered = text.lower()
     return any(marker in lowered for marker in _TIMER_MARKERS)
 
 
-def plausibly_asks_for_action(text: str) -> bool:
+def plausibly_asks_for_action(text: str, *, pass_on: bool = True) -> bool:
     """Does this text ask for something DONE (any armed capability)?
 
     The same union fallback_decision uses, exposed on its own so the text-side
@@ -497,7 +556,9 @@ def plausibly_asks_for_action(text: str) -> bool:
         or plausibly_wants_remember(text)
         or plausibly_wants_music(text)
         or plausibly_messages_kael(text)
+        or (pass_on and plausibly_passes_words_on(text))
         or plausibly_sets_a_timer(text)
+        or plausibly_fills_a_cart(text)
     )
 
 
@@ -542,7 +603,9 @@ def parse_route_reply(
         # tier is a hint (see module docstring): normalize, never reject — a
         # garbage tier must not throw away a perfectly good route decision.
         unaddressed = data.get("unaddressed") is True
-        if unaddressed and plausibly_asks_for_action(user_text):
+        # A pass-on ask never overrides the verdict (Codex review, 11/12): "can you tell him..." said to
+        # someone else in the room is theirs to answer. Only the device-style shapes below do.
+        if unaddressed and plausibly_asks_for_action(user_text, pass_on=False):
             # Structural guard, not a prompt promise: a command-shaped message
             # is NEVER dropped, whatever the model judged — eating a real
             # "turn off the lights" is the one failure this feature must not

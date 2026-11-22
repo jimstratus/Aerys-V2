@@ -12,7 +12,7 @@ import json
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from aerys_v2.factory import SPECIALIST_CHARTER, ToolModelPair, build_action_graph
+from aerys_v2.factory import SPECIALIST_CHARTER, build_action_graph
 from aerys_v2.service import ACTION_SEED_TRUNCATE_AT, _action_history_seed
 from aerys_v2.services.content_privacy import CONTENT_PRIVACY_KEY
 import aerys_v2.tools.home_control as hc
@@ -25,68 +25,42 @@ from aerys_v2.tools.home_control import (
 
 hc._VERIFY_DELAYS_S = (0.0, 0.0)  # the read-back grace is real time; tests don't wait
 
-# ---- ToolModelPair: conversation free, specialist forced-then-free, fast pair ----
+# ---- Agent model policy: conversation free, specialist forced then free ----
+from aerys_v2.action_loop import AgentToolModels
+
+FIRST = [HumanMessage(content="dim the sample room")]
+AFTER_TOOL = [*FIRST, AIMessage(content="", tool_calls=[{"name": "home_control", "args": {}, "id": "c1"}]),
+              ToolMessage(content="Done", tool_call_id="c1")]
 
 
-class Recorder:
-    def __init__(self, name):
-        self.name = name
-        self.calls = []
-
-    def invoke(self, messages, **kw):
-        self.calls.append(list(messages))
-        return AIMessage(content=self.name)
-
-
-def _trio():
-    conv, auto, forced = Recorder("conv"), Recorder("auto"), Recorder("forced")
-    fa, ff = Recorder("fast_auto"), Recorder("fast_forced")
-    return conv, auto, forced, fa, ff, ToolModelPair(conv, auto, forced, fa, ff)
-
-
-FIRST = [HumanMessage(content="sys"), HumanMessage(content="dim the sunroom")]
-AFTER_TOOL = [
-    *FIRST,
-    AIMessage(content="", tool_calls=[{"name": "home_control", "args": {}, "id": "c1"}]),
-    ToolMessage(content="Done: set_brightness 50% sent", tool_call_id="c1"),
-]
+def _models():
+    return AgentToolModels("conv", ("standard", True), ("fast", True))
 
 
 def test_pair_forces_the_first_pass_only():
-    conv, auto, forced, fa, ff, pair = _trio()
-    assert pair.invoke(FIRST, specialist=True).content == "forced"
-    assert pair.invoke(AFTER_TOOL, specialist=True).content == "auto"
-    assert not conv.calls and not fa.calls and not ff.calls
+    models = _models()
+    assert models.choose(FIRST, specialist=True, fast=False) == ("standard", "any")
+    assert models.choose(AFTER_TOOL, specialist=True, fast=False) == ("standard", None)
 
 
 def test_pair_fast_tier_uses_the_fast_models():
-    conv, auto, forced, fa, ff, pair = _trio()
-    assert pair.invoke(FIRST, specialist=True, fast=True).content == "fast_forced"
-    assert pair.invoke(AFTER_TOOL, specialist=True, fast=True).content == "fast_auto"
-    assert not auto.calls and not forced.calls
+    models = _models()
+    assert models.choose(FIRST, specialist=True, fast=True) == ("fast", "any")
+    assert models.choose(AFTER_TOOL, specialist=True, fast=True) == ("fast", None)
 
 
 def test_pair_conversation_is_never_forced_and_never_fast():
-    # Voice banter rides this graph as conversation: the daily driver, free.
-    conv, auto, forced, fa, ff, pair = _trio()
-    assert pair.invoke(FIRST).content == "conv"
-    assert pair.invoke(FIRST, fast=True).content == "conv"
-    assert not forced.calls and not ff.calls
+    for fast in (False, True):
+        assert _models().choose(FIRST, specialist=False, fast=fast) == ("conv", None)
 
 
 def test_pair_without_fast_models_falls_back_to_standard():
-    conv, auto, forced = Recorder("conv"), Recorder("auto"), Recorder("forced")
-    pair = ToolModelPair(conv, auto, forced)
-    assert pair.invoke(FIRST, specialist=True, fast=True).content == "forced"
+    assert AgentToolModels("conv", ("standard", True)).choose(FIRST, specialist=True, fast=True) == ("standard", "any")
 
 
 def test_pair_honesty_bounce_is_a_free_pass():
-    # The gate's bounce re-invokes with the model's own no-tool answer appended —
-    # an assistant turn is in view, so forcing must NOT apply (the loop must be
-    # able to end on a plain answer).
-    conv, auto, forced, fa, ff, pair = _trio()
-    bounced = [HumanMessage(content="x"), AIMessage(content="I can't"), HumanMessage(content="use a tool")]
-    assert pair.invoke(bounced, specialist=True).content == "auto"
+    bounced = [HumanMessage(content="x"), AIMessage(content="I cannot"), HumanMessage(content="use a tool")]
+    assert _models().choose(bounced, specialist=True, fast=False) == ("standard", None)
 
 
 # ---- the charter rides the prompt slot the soul used to -------------------------
@@ -120,23 +94,14 @@ def test_specialist_prompt_leads_with_charter_not_soul():
     assert model.prompts[1][0].content.startswith("SOUL: a Curious Sentinel")
 
 
-def test_specialist_prompt_carries_the_fast_tier_into_the_pair():
-    class TierRecorder(ToolModelPair):
-        def __init__(self):
-            self.seen = []
-        def invoke(self, messages, *, specialist=False, fast=False, **kw):
-            self.seen.append((specialist, fast))
-            return AIMessage(content="done")
-    model = TierRecorder()
-    graph = build_action_graph(model, "soul", tools=[])
-    ident = {"user_id": "p1", "display_name": "Chris"}
-    graph.invoke({"messages": [HumanMessage(content="x")]},
-                 {"configurable": {"identity": ident, "specialist": True, "tier": "fast"}})
-    graph.invoke({"messages": [HumanMessage(content="x")]},
-                 {"configurable": {"identity": ident, "specialist": True, "tier": "standard"}})
-    graph.invoke({"messages": [HumanMessage(content="x")]},
-                 {"configurable": {"identity": ident, "tier": "fast"}})
-    assert model.seen == [(True, True), (True, False), (False, True)]
+def test_specialist_prompt_carries_the_fast_tier_into_the_agent():
+    from test_action_loop_agent import Rec
+    log, script = [], [AIMessage(content="done") for _ in range(3)]
+    conv, std, fast = (Rec(label=n, script=script, log=log) for n in ("conv", "std", "fast"))
+    graph = build_action_graph(AgentToolModels(conv, (std, True), (fast, True)), "soul", tools=[])
+    for config in ({"specialist": True, "tier": "fast"}, {"specialist": True, "tier": "standard"}, {"tier": "fast"}):
+        graph.invoke({"messages": [HumanMessage(content="x")]}, {"configurable": config})
+    assert [p["model"] for p in log] == ["fast", "std", "conv"]
 
 
 # ---- the seed: prior REQUESTS only, truncated, current last ------------------------
@@ -214,6 +179,105 @@ def test_seed_escalated_turn_uses_the_checkpointed_current_request():
     assert len(seeded) == 1
     assert "- earlier ask" in seeded[0].content and seeded[0].content.endswith("dim the sunroom by half")
     assert "<<handoff>>" not in seeded[0].content and "sure" not in seeded[0].content
+
+
+
+
+# ---- #182 (11/10): her hands see the conversation ------------------------------------------
+# Chris, 11/10: "i need actions to have context about a conversation its how you and i work. if her
+# hands dont know the full conversation she will build garbage." The specialist now gets the same
+# room-gated conversation chat gets (ACTION_CONTEXT=full; =requests is the old seed, kept as the undo).
+# September stays fixed another way: an earlier line of hers that says she can't do something is marked
+# where it sits, and the charter says the tools decide.
+
+from aerys_v2.router import HANDOFF_MARKER
+from aerys_v2.service import EARLIER_BELIEF_NOTE
+
+HOWTO = ("Here's a short how-to for giving your voice satellite a fixed IP. " + "Step text. " * 60
+         + "I can also write this up as a file if you want it saved somewhere.")
+PRIVATE = {"identity": {"privacy_context": "private"}}
+
+
+class FullGraph(StubGraph):
+    def __init__(self, messages, window=40, voice_window=12):
+        super().__init__(messages)
+        self.action_context = "full"
+        self.action_context_messages = window
+        self.voice_action_context_messages = voice_window
+
+
+def _pub(text):
+    return HumanMessage(content=text, additional_kwargs={CONTENT_PRIVACY_KEY: "public"})
+
+
+def test_full_seed_is_the_conversation_with_her_replies_and_the_request_last():
+    prior = [_pub("write me a fixed-IP how-to"), AIMessage(content=HOWTO)]
+    seeded = _action_history_seed(FullGraph(prior), PRIVATE, "please if you dont mind", specialist=True)
+    assert [m.type for m in seeded] == ["human", "ai", "human"]
+    assert seeded[1].content == HOWTO                    # her whole reply, offer and all
+    assert seeded[-1].content == "please if you dont mind"
+
+
+def test_full_seed_marks_an_earlier_cant_of_hers_where_it_sits():
+    # September: "I can't set a specific brightness" rode in and she skipped the tool.
+    prior = [_pub("dim the sunroom"), AIMessage(content="I can't set a specific brightness."),
+             _pub("ok thanks"), AIMessage(content="Anytime.")]
+    seeded = _action_history_seed(FullGraph(prior), PRIVATE, "dim the sunroom lights by half", specialist=True)
+    marked = [m for m in seeded if m.type == "ai" and "I can't set a specific brightness." in m.content]
+    assert len(marked) == 1 and EARLIER_BELIEF_NOTE in marked[0].content
+    assert all(EARLIER_BELIEF_NOTE not in m.content for m in seeded if "Anytime." in str(m.content))
+    assert seeded[-1].content == "dim the sunroom lights by half"
+
+
+def test_full_seed_obeys_the_room_gate():
+    prior = [HumanMessage(content="my resting HR was 48", additional_kwargs={CONTENT_PRIVACY_KEY: "private"}),
+             AIMessage(content="Noted, 48 is low and steady."),
+             _pub("turn off the office lights"), AIMessage(content="Off.")]
+    seeded = _action_history_seed(FullGraph(prior), {"identity": {"privacy_context": "public"}}, "turn them back on",
+                                  specialist=True)
+    text = " ".join(str(m.content) for m in seeded)
+    assert "48" not in text and "turn off the office lights" in text and seeded[-1].content == "turn them back on"
+
+
+def test_full_seed_escalated_turn_keeps_chats_reading_and_one_copy_of_the_request():
+    prior = [_pub("write me a fixed-IP how-to"), AIMessage(content=HOWTO), _pub("please if you dont mind"),
+             AIMessage(content=f"Let me save that how-to to a file for you. {HANDOFF_MARKER}")]
+    seeded = _action_history_seed(FullGraph(prior), PRIVATE, "please if you dont mind", escalated=True, specialist=True)
+    text = " ".join(str(m.content) for m in seeded)
+    assert HANDOFF_MARKER not in text
+    assert seeded[-1].type == "human" and seeded[-1].content.startswith("please if you dont mind")
+    assert "Let me save that how-to to a file for you." in seeded[-1].content
+    assert text.count("please if you dont mind") == 1
+
+
+def test_full_seed_keeps_only_the_window():
+    prior = []
+    for i in range(30):
+        prior += [_pub(f"ask {i}"), AIMessage(content=f"done {i}")]
+    seeded = _action_history_seed(FullGraph(prior, window=10), PRIVATE, "now", specialist=True)
+    assert len(seeded) == 11 and seeded[0].content == "ask 25" and seeded[-1].content == "now"
+
+
+def test_full_seed_voice_uses_the_shorter_voice_window():
+    prior = []
+    for i in range(30):
+        prior += [_pub(f"ask {i}"), AIMessage(content=f"done {i}")]
+    seeded = _action_history_seed(FullGraph(prior, window=40, voice_window=4), PRIVATE, "now",
+                                  specialist=True, voice=True)
+    assert len(seeded) == 5 and seeded[0].content == "ask 28"
+
+
+def test_requests_mode_is_the_old_seed_exactly():
+    # The undo: ACTION_CONTEXT=requests (and any graph without the setting) folds his last requests as before.
+    prior = [_pub("write me a fixed-IP how-to"), AIMessage(content=HOWTO)]
+    graph = FullGraph(prior)
+    graph.action_context = "requests"
+    seeded = _action_history_seed(graph, PRIVATE, "please if you dont mind", specialist=True)
+    assert len(seeded) == 1 and "ALREADY HANDLED" in seeded[0].content and "I can also write" not in seeded[0].content
+
+
+def test_charter_says_the_tools_decide_over_her_earlier_words():
+    assert "not a fact" in SPECIALIST_CHARTER and "try the tool" in SPECIALIST_CHARTER
 
 
 # ---- home_control: room targeting, one call, read-back verification -----------------
@@ -456,7 +520,7 @@ from aerys_v2.service import _honest_reply_for_failure  # noqa: E402
 
 def test_recursion_rail_becomes_an_honest_line():
     line = _honest_reply_for_failure(GraphRecursionError("Recursion limit of 10 reached"))
-    assert line and "went in circles" in line
+    assert line and "ran out of steps before finishing" in line
     assert _honest_reply_for_failure(RuntimeError("boom")) is None  # other classes unchanged
 
 
@@ -516,3 +580,27 @@ def test_no_action_forbids_declining_on_a_guess_that_a_room_does_not_exist():
     for phrasing in ("sun room", "sunroom", "the sun room", "sun room lights", "sunroom lights"):
         targets, problem = resolve_targets(phrasing, "turn_off", canary, None)
         assert problem is None and len(targets) == 4, f"{phrasing!r} -> {targets} / {problem}"
+
+
+def test_settings_default_to_full_and_reach_the_chat_graph(monkeypatch):
+    # The knob must reach the graph the seed reads: a graph without it falls back to the old seed
+    # silently, which would make the default a lie.
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from aerys_v2.config import Settings
+    from aerys_v2.factory import action_context_kwargs, build_graph
+    monkeypatch.delenv("ACTION_CONTEXT", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    settings = Settings(_env_file=None)
+    assert settings.action_context == "full"
+    graph = build_graph(FakeListChatModel(responses=["hi"]), soul="s", **action_context_kwargs(settings))
+    assert (graph.action_context, graph.action_context_messages, graph.voice_action_context_messages) == ("full", 40, 12)
+    monkeypatch.setenv("ACTION_CONTEXT", "requests")
+    assert action_context_kwargs(Settings(_env_file=None))["action_context"] == "requests"
+
+
+def test_full_seed_never_crashes_when_the_gate_returns_nothing(monkeypatch):
+    # Gemini review 11/10: an empty gate result would IndexError; the request alone goes instead.
+    import aerys_v2.service as service
+    monkeypatch.setattr(service, "gate_for_room", lambda messages, identity: [])
+    seeded = _action_history_seed(FullGraph([_pub("a"), AIMessage(content="b")]), PRIVATE, "now", specialist=True)
+    assert [m.content for m in seeded] == ["now"]

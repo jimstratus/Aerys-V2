@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # Speaker ID: a capture whose voice matched NO enrolled print ("unknown") drops at
     # this lower floor, alone, no Haiku band — a TV voice is not the household. 20:04–
     # 20:16 on 9/20: four show captures scored 0.07–0.17 against Chris's print; two got
-    # through at background 0.61 and 0.09. (Megan is 'unknown' until enrolled: her real
+    # through at background 0.61 and 0.09. (His wife is 'unknown' until enrolled: her real
     # requests score ~0.1 background, far under this.)
     reflex_unaddressed_guest_floor: float = Field(default=0.5, ge=0, le=1)
     # J10 (2026-09-19, Chris: "silent on voice"): "cancel" / "never mind" drops
@@ -157,10 +157,25 @@ class Settings(BaseSettings):
     # on a turn the router already decided needs one); later passes are free so
     # the loop can end. Env ACTION_FORCE_TOOL=false to bench without it.
     action_force_tool: bool = True
+    # ACTION_LOOP remains accepted for live environment files; create_agent is the only engine.
+    action_loop: Literal["agent"] = "agent"
+    # TEXT_ONE_LOOP (D79, Chris 11/20: "its like im talking to twins"): a household DM's chat-shaped typed
+    # turn runs on the tool-armed action graph as conversation, the way voice has since 2026-07-25. Off by
+    # default. TEXT_ONE_LOOP_FILE, when set and the file says on/off, wins over the setting and is read on
+    # every turn (service.text_one_loop_flag), so it can be flipped without recreating a container.
+    text_one_loop: bool = False
+    text_one_loop_file: str = ""
     # HISTORY_WINDOW_MESSAGES: maximum prior thread messages shown to the model
     # (chat includes the current human in this tail). The checkpointer keeps
     # everything; 0 disables the window. 2026-09-19: 824 messages cost 62,588 tokens.
     history_window_messages: int = 200
+    # ACTION_CONTEXT (#182, Chris 11/10: "if her hands dont know the full conversation she will build
+    # garbage"): what her hands see when she acts. full = the room-gated conversation, her replies
+    # included (the last ACTION_CONTEXT_MESSAGES; voice, metered and latency-bound, the last
+    # VOICE_ACTION_CONTEXT_MESSAGES). requests = the 9/04 seed (his last three requests, folded): the undo.
+    action_context: Literal["full", "requests"] = "full"
+    action_context_messages: int = 40
+    voice_action_context_messages: int = 12
     # PROMPT_CONTEXT_TRAILING: where the per-turn context (clock, memories, room,
     # portable, family) sits. False = inside the system prompt ahead of the
     # history, exactly as before 2026-09-19. True = a trailing block on the
@@ -240,6 +255,7 @@ class Settings(BaseSettings):
     # MUST target `aerys_v2`, never prod `aerys` — run_boot_assertions() below
     # refuses to start otherwise (the two-database footgun, made unbootable).
     database_url: str | None = None
+    her_skills: bool = False
 
     # ---- MEMORY-RETRIEVAL block (long-term context) --------------------------
     # None = memory context OFF. Points at the PROD aerys database (memories/
@@ -263,6 +279,11 @@ class Settings(BaseSettings):
     # lmao". These are his own turns with her, not a whole room, so the count can be
     # generous; the door's own ceiling for the mirror direction is 100.
     portable_context_limit: int = 100
+    # PORTABLE_TEST_BODIES (test_bodies.py, 11/09): bodies whose door turns are tests,
+    # never his words (Kael's gate body, the home body's test jobs). Comma list; their
+    # turns stay in v2_turns but never reach her portable block, her memory, the plan
+    # miner, the gap miner or "his last surface / did he reply".
+    portable_test_bodies: str = "ember,home"
 
     # The owner's persons.id (UUID string). HTTP callers can't prove who they
     # are beyond the Bearer token, so when this is set, voice + /ask identities
@@ -281,7 +302,7 @@ class Settings(BaseSettings):
     # Additional person_ids (CSV) granted ACTION/house-control access beyond the
     # owner. The owner is ALWAYS included implicitly (factory.action_allowlist_for).
     # Extending access = add a person_id here, no code change — this is where
-    # Megan's person_id lands once her identity is solutioned (identical house
+    # His wife's person_id lands once her identity is solutioned (identical house
     # access to Chris). Empty = owner only.
     house_control_person_ids: str = ""
     # Speaker ID (2026-09-20): `name=person_uuid,...` — who each enrolled voice IS.
@@ -301,6 +322,11 @@ class Settings(BaseSettings):
     # match floor the turn is merely uncertain and stays the owner's — fail-open on
     # identity, the same posture the STT wrapper takes when the recognizer is down.
     voice_guest_demote_below: float = Field(default=0.25, ge=0, le=1)
+    # D43 (Chris 11/13, board #195): a short clip right after he spoke on the same speaker is his by default.
+    # The week before, 3 of 9 clips answered as a guest came 16-30 s after him on the same satellite and all
+    # three were him ("Thank you." is too short for the recognizer). An "unknown" verdict on a device that heard
+    # him within this many seconds becomes the unsure band (his by default only); 0 turns it off.
+    voice_owner_carry_s: int = Field(default=60, ge=0, le=300)
     # Chris 2026-09-22: "if the voice is me she should be able to recall what the room
     # said in general for the last number of turns... I dont want guests to be able to
     # poke her memory in that way." The room she LISTENS in, by satellite rather than by
@@ -349,6 +375,11 @@ class Settings(BaseSettings):
     # Chris's whereabouts (approved 2026-10-03 after the BLE soak): his HA person and his
     # phone's settled room. Empty = no whereabouts line; read in presence's one HA call.
     presence_person_entity: str = "person.chris"
+    presence_timezone_entity: str = ""  # Companion current-zone sensor; empty disables travel time.
+    presence_geocoded_entity: str = ""  # Optional companion geocoded sensor; allowlisted fields only.
+    # Where the nearby tool reads GPS from (the HA person carries the phone's tracker). The
+    # presence entity above may be a settled home/away sensor with no coordinates.
+    presence_coords_entity: str = "person.chris"
     presence_settled_entity: str = "sensor.chris_settled_room"
     # The house alarm panel entity (e.g. "alarm_control_panel.panel"). Empty =
     # the control_alarm tool doesn't exist — same arming pattern as ha_token.
@@ -383,6 +414,18 @@ class Settings(BaseSettings):
     ha_timer_fallback_entity: str | None = None
 
     # ---- MUSIC (Music Assistant + Spotify, the 07-01 Play Music rebirth) -----
+    # Natural track-change commentary; spoken volume defaults to the player setting.
+    dj_breaks: bool = True
+    # D53 (11/14): Music Assistant's own MCP server (http://<MA host>:8095/mcp/v1) and its per-client
+    # token, minted in MA and revocable there. Empty = no likes/library/playlists/queue reads; the
+    # music tool's Home Assistant half works either way.
+    ma_mcp_url: str = ""
+    ma_mcp_token: SecretStr | None = None
+    # D54 (11/15): his additions to what a wake-up never touches on its own (entity ids or words,
+    # comma-separated), on top of the alarm, locks and the garage.
+    autonomy_blocked: str = ""
+    dj_cooldown_s: float = Field(default=900, ge=0)
+    dj_announce_volume: int | None = Field(default=None, ge=1, le=100)
     # The Music Assistant CONFIG ENTRY id in HA (Settings → Devices & Services →
     # Music Assistant) — music_assistant.search requires it. Empty = the music
     # tool doesn't exist this boot, same arming pattern as every optional half.
@@ -411,6 +454,149 @@ class Settings(BaseSettings):
     # environment: a LAN IP and a credential, and this repo is public.
     kael_desk_url: str | None = None
     kael_desk_token: SecretStr | None = None
+    # KAEL TICKETS (board #176): every message_kael opens one (tickets.py). These are the
+    # watcher's clocks: remind Kael once after nag_after_h without an answer, and tell the
+    # owner once after tell_owner_after_h when it was his ask. D15 on #176 is the owner's
+    # call; these are the proposed defaults, so his word is a setting, not a rebuild.
+    kael_ticket_nag_after_h: float = 4.0
+    kael_ticket_tell_owner_after_h: float = 24.0
+    # The owner's quiet hours, Eastern (#174, 2026-11-07: "quiet hours between 9PM and
+    # 9 AM"). Inside them a message she owes him arrives as silent text, never spoken.
+    owner_quiet_start_hour: int = 21
+    owner_quiet_end_hour: int = 9
+    # HIS MORNINGS FROM HIS PHONE (D74, the owner 2026-11-19, board #177; wake.py): with both of his
+    # phone's sleep sensors named (the companion app's sleep confidence and sleep segment), quiet
+    # hours end when he's UP (the settled room, presence_settled_entity, leaves wake_bedroom_room
+    # after the night's wake) instead of at owner_quiet_end_hour, which stays the fallback; awake
+    # but not up, what she held overnight arrives as quiet text; asleep by day holds her like a nap.
+    # Empty = off (the fixed hours). Entity ids stay in the environment (this repo is public).
+    wake_sleep_confidence_entity: str = ""
+    wake_sleep_segment_entity: str = ""
+    wake_bedroom_room: str = "bedroom"
+    # D75 (the owner 11/19 10:45, "set time of 11 am would be nice"): awake but still in the bedroom,
+    # her voice comes back at this hour at the latest (Eastern), up or not.
+    wake_awake_quiet_until_hour: int = 11
+    # The owner's meetings (D15, 11/08: "doesnt speak over voice while a meeting is active
+    # and speaks at the next window with a 10 minute buffer"). A csv of HA calendar entities
+    # whose TIMED events are meetings (all-day entries never count); while one is on, and for
+    # owner_meeting_buffer_min after it ends, nothing she says unprompted is spoken out loud.
+    # The entity ids stay in the environment (they can name an employer; this repo is public).
+    owner_meeting_calendars: str = ""
+    owner_meeting_buffer_min: int = 10
+    # THE REACH-OUT DESK (board #176, Stage 2; the owner's D4/D6, 2026-11-08): everything
+    # she starts herself goes through one desk (reach.py). reach_daily_budget = unsolicited
+    # reach-outs a day before he has said otherwise (he steers it in words; his word lives
+    # in v2_reach_prefs). reach_room_devices = 'office=<device_id>,...': the satellite to
+    # speak through in each room the house can place him in (ids stay in the environment).
+    # reach_follow_through_min: a spoken message he doesn't answer gets a text copy.
+    reach_daily_budget: int = 3
+    reach_room_devices: str = ""
+    reach_follow_through_min: int = 5
+    # The quiet surface (company mode): an HA notify service ("mobile_app_<device>"), shown on his
+    # phone, watch and glasses. Empty = storm_notify_service's; neither = a Discord text instead.
+    reach_notify_service: str = ""
+    # A safety warning (a storm WARNING) inside quiet hours breaks through as a text that
+    # buzzes, not out loud in the bedroom; true speaks it where he is, as by day. The
+    # owner's call (board #176); off until he makes it.
+    reach_safety_voice_at_night: bool = False
+    # HER MORNING BRIEF (brief.py; the owner, 2026-11-08: "her voice morning brief hits in the
+    # office when she first detects me in there after waking"). Spoken once a day in brief_room
+    # (it needs a speaker in reach_room_devices), between brief_start_hour and
+    # brief_cutoff_hour Eastern; before brief_solo_hour it also needs proof he's up: one of
+    # brief_wake_entities moved this morning (an automation's last run, or a sensor that's on
+    # and came on), or he talked to her. brief_calendars: personal calendars (titles spoken);
+    # the work ones are owner_meeting_calendars (times only). Entity ids stay in the
+    # environment. Off unless morning_brief is true.
+    morning_brief: bool = False
+    brief_room: str = "office"
+    brief_start_hour: int = 5
+    brief_solo_hour: int = 8
+    brief_cutoff_hour: int = 13
+    brief_wake_entities: str = ""
+    brief_calendars: str = ""
+    brief_weather_entity: str = "weather.forecast_home"
+    # HER EVENING HEADS-UP (brief.py): a sentence or three about tomorrow, once an evening from
+    # evening_start_hour until five minutes before quiet hours, in one of evening_rooms (never
+    # the bedroom) when the house places him there, and only when tomorrow has an early start,
+    # something personal, or rain. Same calendars and forecast as the brief. Off unless
+    # evening_heads_up is true.
+    evening_heads_up: bool = False
+    evening_rooms: str = "office,kitchen"
+    evening_start_hour: int = 19
+    # FOLLOW-UPS (followups.py; the owner's C, 2026-11-08): she checks back when he said yes to
+    # her offer, and checks in, unasked, about appointments on his personal calendars
+    # (brief_calendars; never the work ones) and things he said he'd do. followup_plans: the
+    # plan miner's mode, "shadow" (written, never said: the default until its extractions have
+    # been read), "live", or "off". Off unless followups is true.
+    followups: bool = False
+    followup_plans: str = "shadow"
+    # HER OWN WAKE-UPS (wakeups.py; D40/D41, 2026-11-12): she sets herself one-off or recurring
+    # wake-ups for any task (wake_me), and when one fires she runs one unattended action turn and
+    # tells him (an owed answer through the reach desk), stays quiet, or ends it. The rails, the
+    # owner's defaults ("we can adjust later"): at most wakeup_max_active active, fires at least
+    # wakeup_min_interval_minutes apart, wakeup_default_days to its end unless she sets one and
+    # at most wakeup_max_days; per run wakeup_step_limit graph steps and wakeup_timeout_minutes of
+    # wall clock. Off unless wakeups is true (the tool, the wake graph and the runner).
+    wakeups: bool = False
+    wakeup_max_active: int = 10
+    wakeup_min_interval_minutes: int = 5
+    wakeup_default_days: int = 7
+    wakeup_max_days: int = 90
+    wakeup_step_limit: int = 40
+    wakeup_timeout_minutes: float = 10.0
+    # HER WELCOME-HOME HELLO (welcome.py; board #178; the owner, 2026-11-09: "the 30+ minutes
+    # away works for me", and "she could be inquisitive if i left without anything on the
+    # schedule or she could ask how my appointment went"). When welcome_home_entity (his
+    # settled home/away sensor) turns home after welcome_home_away_minutes or more away (by
+    # HA's own history), and the house settles him in one of welcome_home_rooms (empty = every
+    # room with a speaker but the bedroom) within welcome_home_settle_minutes, she says hi
+    # there; it carries the morning brief when that's still due. Entity ids stay in the
+    # environment. Off unless welcome_home is true.
+    welcome_home: bool = False
+    welcome_home_entity: str = ""
+    welcome_home_away_minutes: int = 30
+    welcome_home_settle_minutes: int = 20
+    welcome_home_rooms: str = ""
+    # THE OWNER'S APPROVAL BUTTON (approvals.py; D10 11/08, D12 11/09): things she may only do
+    # once he taps Approve on a Discord button (the Discord gateway posts it to his DMs; an HA
+    # notification says one is waiting). approvals_owner_discord_id overrides his linked Discord
+    # identity (the id stays in the environment). Off unless approvals is true.
+    approvals: bool = False
+    approvals_owner_discord_id: str = ""
+    approvals_person_discord_ids: str = ""
+    # WHAT WAITS FOR HIS TAP (hands_gate.py; D10 11/08, D12 11/09), on that button: from voice,
+    # a home job starts directly only on a strong match AND an agent listed in
+    # home_read_only_agents (list one only once the home body enforces read-only for it); any
+    # other voice-started job, and her first message to anyone new, waits for his Approve. Off
+    # unless hands_gates is true and approvals is armed.
+    messages_as_herself: bool = False  # D12/D27: explicit opt-in only
+    message_people: str = ""  # comma-separated person UUIDs; deployment env only
+    hands_gates: bool = False
+    home_read_only_agents: str = ""
+    # Separate home-job grant: person UUID=home project, comma separated.
+    home_job_members: str = ""
+    # HER LONG JOBS AT HOME (home_jobs.py; board #176, s3-02): her create_agent loop
+    # starts jobs on her home body through LangChain's AsyncSubAgentMiddleware, at home_url with
+    # home_api_token, behind the D10 gate above. Off unless home_jobs is true AND the gate is armed.
+    home_jobs: bool = False
+    # HER HOME BODY SAYS "I'M DONE" (home_notices.py; board #176, Stage 3). The home server
+    # POSTs a done-notice to /home-notice with home_webhook_token (its own token: the home body
+    # never holds api_token); she tells the owner through the desk. home_url + home_api_token
+    # let her read the job's task and report back from the home server (without them the
+    # notice goes on what it says itself). Addresses and tokens stay in the environment. Off
+    # unless home_notices is true.
+    home_notices: bool = False
+    home_webhook_token: SecretStr | None = None
+    home_url: str = ""
+    home_api_token: SecretStr | None = None
+
+    @field_validator("home_webhook_token", "home_api_token", mode="after")
+    @classmethod
+    def _blank_home_token_is_none(cls, v: SecretStr | None) -> SecretStr | None:
+        # Same fail-closed rule as api_token: a blank token is no token, never "Bearer ".
+        if v is not None and not v.get_secret_value().strip():
+            return None
+        return v
 
     # ---- PANEL FACE (reTerminal desk avatar) ---------------------------------
     # The panel's state endpoint (e.g. "http://<panel-ip>:8300/state"). When set,
@@ -515,6 +701,10 @@ class Settings(BaseSettings):
     # single-satellite behavior) — never a silent drop. Same CSV convention as
     # ha_canary_entities.
     ha_satellite_map: str = ""
+    # csv of entity-id prefixes for the owner's own phone and watch readings (D47, 11/14): her HA reads
+    # show them only to him in his own rooms (a DM, his voice, his glasses), never a room others read.
+    # Kept in .env, never here (public repo). Empty = no reading is held back.
+    ha_private_entities: str = ""
     # csv of "device_id=domain.service" pairs for SPEAKERLESS voice devices
     # (e-ink displays): a follow-up for a mapped device is WRITTEN to its
     # screen via that HA service (an ESPHome user action, e.g.
@@ -554,6 +744,15 @@ class Settings(BaseSettings):
     # None = read_web_page disarmed (tool and overlay both absent).
     firecrawl_api_key: SecretStr | None = None
 
+    # Owner Gmail: independent on-request reads and unsigned create-only drafts.
+    # Shared readonly+compose credentials; neither switch schedules inbox watching.
+    gmail_read: bool = False
+    gmail_drafts: bool = False
+    gmail_drafts_client_id: str | None = None
+    gmail_drafts_client_secret: SecretStr | None = None
+    gmail_drafts_refresh_token: SecretStr | None = None
+    gmail_drafts_from: str | None = None
+
     # ---- EMAIL (her own mailbox — scope decided 2026-07-11) -------------------
     # Aerys's OWN Gmail account over IMAP/SMTP with an app password — the
     # rebuild of n8n's email trio (Email Sub-Agent kbKrKBVUgwU6n9gg, Gmail
@@ -569,6 +768,11 @@ class Settings(BaseSettings):
     # Where arrival pings land: the owner's Discord user id (DM via the bot's
     # REST API — the watcher is its own container and holds no gateway session).
     email_notify_discord_user_id: str | None = None
+    # Board #176, Stage 2: the watcher's pings go through the reach-out desk (a queued
+    # row in v2_reachouts the brain's desk delivers) instead of straight to a Discord
+    # DM. Needs database_url + owner_person_id; the email container must be recreated
+    # to pick it up (--env-file is read at creation).
+    reach_email_via_desk: bool = False
 
     # ---- EXTRACTION WORKER (shadow mode) --------------------------------------
     # The n8n batch extraction (IfqY4BrhBGeQrcTC) re-run as a V2 worker that reads
@@ -641,7 +845,7 @@ class BootConfigError(RuntimeError):
 
 
 def speaker_person_map(settings: "Settings") -> dict[str, str]:
-    """voice_speaker_persons ('chris=<uuid>,megan=<uuid>') -> {name: person_id}, names
+    """voice_speaker_persons ('chris=<uuid>,sam=<uuid>') -> {name: person_id}, names
     lower-cased. Malformed entries are skipped with a warning, never fatal — a bad
     line must not take the voice door down. The owner's name, when listed, must map
     to owner_person_id (anything else is a config error worth shouting about)."""
@@ -763,3 +967,37 @@ def run_boot_assertions(settings: Settings, env_file: Path | None = None) -> Non
                 "match a person and grants no access.",
                 pid,
             )
+
+
+def person_mapping(value: str) -> dict[str, str]:
+    """Parse an env-only person UUID=value grant; reject ambiguous or malformed entries."""
+    from uuid import UUID
+
+    result = {}
+    for entry in str(value or "").split(","):
+        if not entry.strip():
+            continue
+        person, sep, target = entry.strip().partition("=")
+        person, target = person.strip(), target.strip()
+        if not sep or not target or str(UUID(person)) != person or person in result:
+            raise ValueError("invalid person mapping")
+        result[person] = target
+    return result
+
+
+def home_job_member_map(settings) -> dict[str, str]:
+    """Explicit home-job grants; independent of house-control permissions."""
+    from uuid import UUID
+
+    members = {}
+    for entry in str(getattr(settings, "home_job_members", "") or "").split(","):
+        if not entry.strip():
+            continue
+        person, sep, project = entry.partition("=")
+        if not sep or not project.strip():
+            raise ValueError("HOME_JOB_MEMBERS requires person UUID=project")
+        person = str(UUID(person.strip()))
+        if person == str(getattr(settings, "owner_person_id", "")) or project.strip() == "home":
+            raise ValueError("HOME_JOB_MEMBERS must use a separate member and project")
+        members[person] = project.strip()
+    return members

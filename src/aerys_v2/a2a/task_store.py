@@ -269,6 +269,20 @@ class ReceiptStore:
                 ) > (task.status.timestamp.seconds, task.status.timestamp.nanos):
                     self.db.execute("COMMIT")
                     return previous
+                if (
+                    previous
+                    and previous.status.state in terminal
+                    and task.status.state == previous.status.state
+                    and previous.status.HasField("message")
+                    and not task.status.HasField("message")
+                ):
+                    # A message-only terminal result is evidence too: a later bare
+                    # same-state snapshot may add artifacts but must not erase it.
+                    # Merge into a copy so the caller's Task is never mutated.
+                    merged = Task()
+                    merged.CopyFrom(task)
+                    merged.status.message.CopyFrom(previous.status.message)
+                    task = merged
             elif row["remote_id"]:
                 self.db.execute("COMMIT")
                 return previous

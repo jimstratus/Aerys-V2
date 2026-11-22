@@ -165,12 +165,15 @@ class PeerHandler(RequestHandler):
                 span.set_attribute("eotir.agent.id", "aerys")
                 span.set_attribute("a2a.peer.id", request.principal)
                 result = await self.execute(request)
-            if not isinstance(result, str) or len(result.encode()) > 65536:
+            if not isinstance(result, str):
+                raise ValueError("executor result must be bounded text")
+            # Bound what is actually stored/returned: redaction can EXPAND text
+            # ("token=x" -> "token=[REDACTED]"), so measure after scrubbing.
+            safe = scrub(result, self.registry.redactions())
+            if len(safe.encode()) > 65536:
                 raise ValueError("executor result must be bounded text")
             task.status.state = TaskState.TASK_STATE_COMPLETED
-            task.artifacts.add(artifact_id=uuid4().hex).parts.add(
-                text=scrub(result, self.registry.redactions())
-            )
+            task.artifacts.add(artifact_id=uuid4().hex).parts.add(text=safe)
         except asyncio.CancelledError:
             task.status.state = TaskState.TASK_STATE_INPUT_REQUIRED
             task.status.message.role = 2
@@ -256,7 +259,9 @@ class PeerHandler(RequestHandler):
 
 
 # host[:port] only: letters/digits/dot/dash, or a bracketed IPv6 literal.
-_CARD_HOST = re.compile(r"(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::[0-9]{1,5})?")
+_CARD_HOST = re.compile(
+    r"(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::[0-9]{1,5})?"
+)
 
 
 def build_peer_app(
@@ -334,11 +339,17 @@ def build_peer_app(
         from starlette.routing import Route
 
         async def host_card(request):
-            raw = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            raw = request.headers.get("x-forwarded-host") or request.headers.get(
+                "host", ""
+            )
             host = raw.split(",")[0].strip()
             if not _CARD_HOST.fullmatch(host):
                 return JSONResponse({"error": "bad host"}, status_code=400)
-            proto = (request.headers.get("x-forwarded-proto") or "http").split(",")[0].strip()
+            proto = (
+                (request.headers.get("x-forwarded-proto") or "http")
+                .split(",")[0]
+                .strip()
+            )
             scheme = proto if proto in ("http", "https") else "http"
             served = AgentCard()
             served.CopyFrom(card)

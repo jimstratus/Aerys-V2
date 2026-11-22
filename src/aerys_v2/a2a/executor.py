@@ -1,6 +1,8 @@
 """Restricted assistant adapter. No household/owner collaborators can be injected."""
 
 import asyncio
+import contextvars
+import threading
 
 
 class PeerAssistant:
@@ -37,12 +39,37 @@ class PeerAssistant:
         )
 
     async def __call__(self, request):
-        # The transport drains this work before releasing its executor lock.
-        job = asyncio.create_task(asyncio.to_thread(self._ask, request))
-        try:
-            return await asyncio.shield(job)
-        except asyncio.CancelledError:
-            # A canceled asyncio waiter does not stop its Python worker thread.
-            # Keep the executor lease until that worker really exits.
-            await asyncio.shield(job)
-            raise
+        # The transport drains this work before releasing its executor lock, so
+        # this coroutine must not finish until the worker THREAD has exited.
+        # A canceled asyncio waiter cannot stop a Python thread, and shutdown
+        # can cancel more than once (or cancel an inner to_thread task), so
+        # completion is tied to the thread itself, and every cancellation is
+        # absorbed until then and re-raised once at the end.
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+        outcome = {}
+        ctx = contextvars.copy_context()  # keep trace parentage, like to_thread
+
+        def work():
+            try:
+                outcome["value"] = ctx.run(self._ask, request)
+            except BaseException as exc:  # delivered to the awaiting task below
+                outcome["error"] = exc
+            finally:
+                try:
+                    loop.call_soon_threadsafe(finished.set)
+                except RuntimeError:  # loop already closed; nobody is waiting
+                    pass
+
+        threading.Thread(target=work, name="aerys-peer-ask").start()
+        canceled = False
+        while not finished.is_set():
+            try:
+                await finished.wait()
+            except asyncio.CancelledError:
+                canceled = True
+        if canceled:
+            raise asyncio.CancelledError
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]

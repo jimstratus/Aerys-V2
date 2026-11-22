@@ -19,7 +19,8 @@ mismatch). The inventory check now also compares the checkout's full module
 inventory with the wheel, so an extra module can't slip through either. To stage
 a pilot from current source, cut a new wheel, requirements lock and runtime
 manifest from the merged commit, have them reviewed, and update `SOURCE`,
-`MANIFEST_SHA256` and `pilot-source-lock.json` together. Do not edit the pins to
+`MANIFEST_SHA256` and `pilot-source-lock.json` together. The Hermes-interop round (2026-11-22) also changed the pinned
+`deploy/a2a/aerys-a2a.service` and `config.example.json`, so those pins are stale too. Do not edit the pins to
 match without new reviewed artifacts.
 
 ## Imported original artifacts

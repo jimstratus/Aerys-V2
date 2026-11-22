@@ -1,5 +1,5 @@
 {
-  "public_url": "https://aerys.example.invalid/",
+  "public_url": "",
   "tenant": "aerys",
   "host": "0.0.0.0",
   "port": 9901,
@@ -11,16 +11,23 @@
   "max_body": 65536,
   "peers": [
     {
-      "id": "example-peer",
-      "url": "https://peer.example.invalid/profile/",
-      "tenant": "profile",
-      "card_name": "Exact verified Agent Card name",
-      "token_env": "EXAMPLE_PEER_INBOUND_TOKEN",
-      "outbound_token_env": "EXAMPLE_PEER_OUTBOUND_TOKEN",
+      "id": "rook",
+      "url": "http://127.0.0.1:19957/rook/",
+      "tenant": "rook",
+      "card_name": "Rook (RK-1)",
+      "token_env": "ROOK_INBOUND_TOKEN",
+      "outbound_token_env": "ROOK_OUTBOUND_TOKEN",
       "state": "active",
-      "grants": ["send", "get", "list", "cancel"],
-      "capabilities": ["text"],
-      "timeout": 30
+      "grants": [
+        "send",
+        "get",
+        "list",
+        "cancel"
+      ],
+      "capabilities": [
+        "text"
+      ],
+      "timeout": 300
     }
   ]
 }

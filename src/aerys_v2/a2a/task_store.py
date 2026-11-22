@@ -230,6 +230,28 @@ class ReceiptStore:
             == 1
         )
 
+    def pin_remote(self, dispatch_id, remote_id):
+        """Bind the first observed receiver task ID, atomically and immutably.
+
+        Called before result validation, so an unsupported/odd result still
+        leaves recovery on GetTask(original) instead of ListTasks-and-rebind.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.dispatch(dispatch_id)
+            if row is None:
+                raise KeyError(dispatch_id)
+            if row["remote_id"] and row["remote_id"] != remote_id:
+                raise ValueError("Original remote identity is immutable")
+            self.db.execute(
+                "UPDATE dispatches SET remote_id=? WHERE id=? AND remote_id IS NULL",
+                (remote_id, dispatch_id),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
     def record_dispatch(self, dispatch_id, state, task=None):
         # Pin receiver identity and preserve monotonic terminal evidence even when
         # send and poll responses race across independent client processes.
@@ -263,10 +285,23 @@ class ReceiptStore:
                     if task.status.state not in terminal or previous.artifacts:
                         self.db.execute("COMMIT")
                         return previous
-                if previous and (
-                    previous.status.timestamp.seconds,
-                    previous.status.timestamp.nanos,
-                ) > (task.status.timestamp.seconds, task.status.timestamp.nanos):
+                # A nonterminal -> terminal transition always lands: peers may omit
+                # the completion timestamp, and comparing an unset (0) stamp with an
+                # earlier WORKING stamp would discard the final result forever.
+                becomes_terminal = (
+                    previous is not None
+                    and previous.status.state not in terminal
+                    and task.status.state in terminal
+                )
+                if (
+                    previous
+                    and not becomes_terminal
+                    and (
+                        previous.status.timestamp.seconds,
+                        previous.status.timestamp.nanos,
+                    )
+                    > (task.status.timestamp.seconds, task.status.timestamp.nanos)
+                ):
                     self.db.execute("COMMIT")
                     return previous
                 if (

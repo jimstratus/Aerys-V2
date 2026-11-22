@@ -64,6 +64,10 @@ class PeerClient:
     def _record(self, dispatch_id, task, expected_context):
         if not task.id or task.context_id != expected_context:
             raise ReconciliationRequired("Remote task identity/context mismatch")
+        # Pin the receiver identity BEFORE judging the result: if the parts are
+        # unsupported we stay unresolved, but recovery then reads this exact
+        # task (GetTask) rather than re-listing the context and rebinding.
+        self.store.pin_remote(dispatch_id, task.id)
         clean = Task(id=task.id, context_id=task.context_id)
         clean.status.state = task.status.state
         clean.status.timestamp.CopyFrom(task.status.timestamp)
@@ -79,10 +83,15 @@ class PeerClient:
             clean.status.message.role = Role.ROLE_AGENT
             clean.status.message.message_id = task.status.message.message_id
             for part in task.status.message.parts:
-                if part.WhichOneof("content") == "text":
-                    clean.status.message.parts.add(
-                        text=scrub(part.text, self.registry.redactions())
+                # Same rule as artifacts: dropping a file/data answer would turn
+                # "unknown result" into a fake successful text exchange.
+                if part.WhichOneof("content") != "text":
+                    raise ReconciliationRequired(
+                        "Unsupported result part; do not infer success"
                     )
+                clean.status.message.parts.add(
+                    text=scrub(part.text, self.registry.redactions())
+                )
         return self.store.record_dispatch(dispatch_id, "accepted", clean)
 
     async def submit(self, peer_id, text, *, dispatch_id):

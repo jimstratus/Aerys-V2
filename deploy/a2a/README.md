@@ -76,6 +76,52 @@ public ingress. Ansible must enforce source/destination firewall policy. Protect
 model egress and remote A2A destinations. The public card endpoint and unauthenticated
 `/healthz` contain no credentials but are not a substitute for network isolation.
 
+## Hermes interoperability (verified 2026-11-22)
+
+Tested against the installed Hermes A2A plugin (`/usr/local/lib/hermes-agent`), not
+a mock: Hermes's real `a2a_call` drives Aerys (opt-in test
+`tests/test_peer_hermes_runtime.py`, about 2 min while Hermes provisions an isolated
+runtime), and Aerys `PeerClient` drove a real Hermes A2A server (the T290 local bridge):
+blocking `SendMessage` returned a completed task, and `GetTask` reconciliation read the
+same task back.
+
+**Hermes -> Aerys (Hermes side config).** Add an `a2a_agents` entry on the calling
+Hermes profile, with the same shape as the existing T289/T316 peers:
+
+```yaml
+a2a_agents:
+  aerys:
+    url: http://127.0.0.1:<tunnel-port>      # whatever address THIS caller uses
+    auth: {type: bearer, token: ${AERYS_A2A_<CALLER>_TOKEN}}
+    tenant: aerys
+    timeout: 300
+```
+
+Hermes `a2a_call` sends ONE blocking `SendMessage` and never polls, so Aerys answers
+synchronously (it does). It also POSTs to the URL in Aerys's agent card, so **leave
+`public_url` empty**: the card then advertises the caller's own `Host` (same rule as
+Hermes with `A2A_PUBLIC_URL` unset), which is the only setting that works for callers
+coming in on different routes (SSH tunnel, tailnet). Set `public_url` only when every
+caller uses one fixed address. A fixed URL the caller can't reach gives "connection
+refused" on every call (reproduced).
+
+**Aerys -> Hermes (Aerys side enrollment).** `card_name`, `url` and `tenant` must
+equal the live card EXACTLY, including the trailing slash. Values seen through the
+ansible-control tunnels on 2026-11-22 (re-read them from the route Aerys will use):
+
+| Peer | card_name | url (JSONRPC interface) | tenant |
+| --- | --- | --- | --- |
+| Rook on Artie | `Rook (RK-1)` | `http://127.0.0.1:19957/rook/` | `rook` |
+| Cadence on Vector | `Cadence (CDN-8)` | `http://127.0.0.1:19930/cadence/` | `cadence` |
+| Artie (root) | `artie` | `http://127.0.0.1:19957/` | *(empty)* |
+| Vector (root) | `VCT-9` | `http://127.0.0.1:19930/` | *(empty)* |
+
+Root Hermes agents advertise no tenant; leave `tenant` unset for them. Hermes cards
+follow the request Host, so the URL is the address Aerys itself dials. Use
+`timeout: 300`, as Hermes turns can take minutes (T316 peers use 300); the 30 s
+default is too short for real Hermes inference. Each direction needs its own
+newly issued, scoped bearer token. Do not reuse the ansible-control T289 tokens.
+
 ## Startup, health and shutdown acceptance
 
 1. Validate config/credentials with `aerys-v2-a2a --config /etc/aerys/a2a.json --check`.

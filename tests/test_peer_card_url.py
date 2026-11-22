@@ -52,7 +52,7 @@ async def test_explicit_public_url_still_wins(tmp_path):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("host", ["evil.example/path", "a b", "x@y", "h\"q"])
+@pytest.mark.parametrize("host", ["evil.example/path", "a b", "x@y", 'h"q'])
 async def test_malformed_host_is_refused(tmp_path, host):
     app = build_peer_app(registry(), ReceiptStore(tmp_path / "r.db"), None, url="")
     r = await _card(app, {"Host": host})

@@ -82,6 +82,18 @@ def create_app(settings: PeerSettings, *, secrets=None, model=None):
     )
 
 
+def isolate_from_owner_environment(environ=os.environ):
+    """Peer process only: never fall back to the owner's household data.
+
+    The shared graph code imports house_names, whose loader reads the owner's
+    `.env` (cwd-relative) when AERYS_HOUSE_NAMES is absent. Set-but-empty wins
+    over the file by design, so pinning it here keeps the peer listener
+    explicit-config-only even when launched from an owner worktree. Must run
+    before anything imports aerys_v2.factory.
+    """
+    environ["AERYS_HOUSE_NAMES"] = ""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Isolated Aerys A2A peer listener (not owner /ask)"
@@ -93,6 +105,7 @@ def main():
         help="validate enrollment and credentials without binding or calling a model",
     )
     args = parser.parse_args()
+    isolate_from_owner_environment()
     try:
         settings = PeerSettings.model_validate_json(args.config.read_text())
         Registry(settings.peers)

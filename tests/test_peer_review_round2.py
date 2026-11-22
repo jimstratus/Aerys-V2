@@ -159,3 +159,104 @@ def test_repeated_cancel_waits_for_worker_thread(monkeypatch):
         assert finished.is_set()
 
     asyncio.run(run())
+
+
+# --- independent review round (PR #3)
+
+
+def test_submit_propagates_cancellation_and_marks_uncertain(tmp_path, monkeypatch):
+    client, store, row = _client(tmp_path)
+
+    class Hang:
+        async def send_message(self, *a, **k):
+            await asyncio.Event().wait()
+
+    async def fake_transport(peer_id, operation):
+        return client.registry.peer(peer_id), Hang()
+
+    monkeypatch.setattr(client, "_transport", fake_transport)
+
+    async def run():
+        with pytest.raises(TimeoutError):  # NOT ReconciliationRequired
+            await asyncio.wait_for(
+                client.submit("alice", "hello", dispatch_id="d1"), 0.2
+            )
+
+    asyncio.run(run())
+    assert store.dispatch("d1")["state"] == "uncertain"
+    store.close()
+
+
+def test_result_finished_during_cancel_is_recorded_not_dropped(tmp_path):
+    from aerys_v2.a2a.executor import CanceledAfterCompletion
+
+    async def run():
+        async def execute(_):
+            raise CanceledAfterCompletion("finished answer")
+
+        app = await _serve(tmp_path, execute)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as c:
+                await rpc(c, "SendMessage", send())
+                return (
+                    await rpc(
+                        c, "ListTasks", {"tenant": "aerys", "includeArtifacts": True}
+                    )
+                ).json()
+
+    try:
+        asyncio.run(run())
+    except BaseException:  # cancellation may surface; the receipt is what matters
+        pass
+    store = ReceiptStore(tmp_path / "s.db")
+    task = store.list_page("alice", "", "", offset=0, limit=10)[0][0]
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert task.artifacts[0].parts[0].text == "finished answer"
+    store.close()
+
+
+def test_working_save_failure_still_attempts_failed_state(tmp_path, monkeypatch):
+    saved = []
+
+    async def run():
+        async def execute(_):
+            return "never reached"
+
+        app = await _serve(tmp_path, execute)
+        store_cls = ReceiptStore
+        orig = store_cls.save
+
+        def flaky(self, task):
+            saved.append(TaskState.Name(task.status.state))
+            if task.status.state == TaskState.TASK_STATE_WORKING:
+                raise OSError("disk busy")
+            return orig(self, task)
+
+        monkeypatch.setattr(store_cls, "save", flaky)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as c:
+                return (await rpc(c, "SendMessage", send())).json()
+
+    out = asyncio.run(run())
+    assert saved[-1] == "TASK_STATE_FAILED", saved
+    assert out["result"]["task"]["status"]["state"] == "TASK_STATE_FAILED"
+
+
+def test_host_derived_card_is_not_cacheable(tmp_path):
+    async def run():
+        app = build_peer_app(registry(), ReceiptStore(tmp_path / "c.db"), None, url="")
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://x"
+            ) as c:
+                return await c.get(
+                    "/.well-known/agent-card.json", headers={"Host": "h:1"}
+                )
+
+    r = asyncio.run(run())
+    assert r.headers["cache-control"] == "no-store"
+    assert "host" in r.headers.get("vary", "").lower()

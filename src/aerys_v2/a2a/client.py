@@ -121,7 +121,12 @@ class PeerClient:
             if not response.HasField("task"):
                 raise ReconciliationRequired("Peer did not return a durable task")
             return self._record(dispatch_id, response.task, row["context"])
-        except (Exception, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            # Outcome unknown, but cancellation must keep propagating (wait_for,
+            # TaskGroup teardown); converting it would break callers' unwinding.
+            self.store.record_dispatch(dispatch_id, "uncertain")
+            raise
+        except Exception:
             self.store.record_dispatch(dispatch_id, "uncertain")
             raise ReconciliationRequired(
                 "Send outcome uncertain; reconcile original dispatch ID"

@@ -153,8 +153,11 @@ class PeerHandler(RequestHandler):
         if current.status.state == TaskState.TASK_STATE_CANCELED:
             return
         task.status.state = TaskState.TASK_STATE_WORKING
-        self.store.save(task)
         try:
+            # Inside the try: a store error here must end as a FAILED save
+            # attempt (generic message), not a stuck SUBMITTED receipt or a
+            # raw exception text returned to the peer.
+            self.store.save(task)
             with tracer.start_as_current_span(
                 "a2a.execute",
                 context=propagator.extract(trace),
@@ -174,7 +177,18 @@ class PeerHandler(RequestHandler):
                 raise ValueError("executor result must be bounded text")
             task.status.state = TaskState.TASK_STATE_COMPLETED
             task.artifacts.add(artifact_id=uuid4().hex).parts.add(text=safe)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as canceled:
+            finished = getattr(canceled, "result", None)
+            safe = (
+                scrub(finished, self.registry.redactions())
+                if isinstance(finished, str)
+                else None
+            )
+            if safe is not None and len(safe.encode()) <= 65536:
+                # The work completed before shutdown reached it: keep the answer.
+                task.status.state = TaskState.TASK_STATE_COMPLETED
+                task.artifacts.add(artifact_id=uuid4().hex).parts.add(text=safe)
+                raise
             task.status.state = TaskState.TASK_STATE_INPUT_REQUIRED
             task.status.message.role = 2
             task.status.message.message_id = uuid4().hex
@@ -354,7 +368,16 @@ def build_peer_app(
             served = AgentCard()
             served.CopyFrom(card)
             served.supported_interfaces[0].url = f"{scheme}://{host}/"
-            return JSONResponse(agent_card_to_dict(served))
+            # Per-request content: never let a shared cache serve one caller's
+            # Host-derived URL to another (a poisoned card would redirect
+            # bearer tokens).
+            return JSONResponse(
+                agent_card_to_dict(served),
+                headers={
+                    "Cache-Control": "no-store",
+                    "Vary": "Host, X-Forwarded-Host, X-Forwarded-Proto",
+                },
+            )
 
         app.router.routes.append(
             Route("/.well-known/agent-card.json", host_card, methods=["GET"])

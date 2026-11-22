@@ -5,6 +5,16 @@ import contextvars
 import threading
 
 
+class CanceledAfterCompletion(asyncio.CancelledError):
+    """Cancellation that arrived while the worker was running, after which the
+    worker FINISHED. Still a cancellation (it propagates), but it carries the
+    completed answer so the transport records it instead of "interrupted"."""
+
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+
+
 class PeerAssistant:
     def __init__(self, model):
         self.model = model
@@ -69,6 +79,8 @@ class PeerAssistant:
             except asyncio.CancelledError:
                 canceled = True
         if canceled:
+            if "value" in outcome:
+                raise CanceledAfterCompletion(outcome["value"])
             raise asyncio.CancelledError
         if "error" in outcome:
             raise outcome["error"]

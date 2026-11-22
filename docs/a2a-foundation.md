@@ -172,3 +172,17 @@ source/build hashes belong in the release receipt, not a claim of all-green CI.
   `client/card_resolver.py`, `types/a2a_pb2.py`. This release uses protobuf types and
   route factories, not historical `a2a.server.apps.A2AFastAPIApplication` imports.
 - Canonical source home: https://github.com/jimstratus/Aerys-V2 .
+
+## Known limitations (independent review, 2026-11-22)
+
+- **No receipt retention bound.** Every accepted inbound message adds a receipt row,
+  and nothing prunes them. Only concurrency is capped (`capacity`). Size the volume and
+  plan an operator prune and archive job before long-running use.
+- **Context-ID claiming.** The first peer to use a context ID owns it, and other
+  peers' messages with that ID are refused. Hermes generates random IDs, so this only
+  matters with a hostile or compromised *enrolled* peer, which can deny service on
+  IDs it guesses but cannot read other peers' tasks.
+- **Host-derived agent card** (`public_url` empty) reflects the caller's `Host` /
+  `X-Forwarded-*`. It is served with `Cache-Control: no-store` and `Vary`. Do not put a
+  caching proxy in front of the card without it, and set `public_url` when the listener
+  sits behind an untrusted proxy.

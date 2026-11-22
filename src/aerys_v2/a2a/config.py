@@ -12,7 +12,9 @@ from aerys_v2.a2a.task_store import ReceiptStore
 
 class PeerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    public_url: str
+    # Empty = advertise the caller's own Host in the agent card (works through
+    # SSH tunnels / multiple routes, like Hermes with A2A_PUBLIC_URL unset).
+    public_url: str = ""
     tenant: str = Field(default="aerys", min_length=1, max_length=128)
     host: str = "127.0.0.1"
     port: int = Field(default=9901, ge=1, le=65535)
@@ -29,13 +31,14 @@ class PeerSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_paths(self):
-        Peer(
-            id="listener",
-            url=self.public_url,
-            card_name="Aerys",
-            token_env="UNUSED",
-            allow_insecure_http=self.allow_private_http,
-        )
+        if self.public_url:
+            Peer(
+                id="listener",
+                url=self.public_url,
+                card_name="Aerys",
+                token_env="UNUSED",
+                allow_insecure_http=self.allow_private_http,
+            )
         if not self.receipt_path.is_absolute():
             raise ValueError(
                 "receipt path must be absolute and on a persistent private volume"

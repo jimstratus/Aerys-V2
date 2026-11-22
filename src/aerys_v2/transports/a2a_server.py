@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -254,6 +255,10 @@ class PeerHandler(RequestHandler):
     on_subscribe_to_task = unsupported_stream
 
 
+# host[:port] only: letters/digits/dot/dash, or a bracketed IPv6 literal.
+_CARD_HOST = re.compile(r"(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::[0-9]{1,5})?")
+
+
 def build_peer_app(
     registry, store, execute, *, url, tenant="aerys", capacity=8, max_body=65536
 ):
@@ -316,7 +321,33 @@ def build_peer_app(
         },
         AgentCard(),
     )
-    app.router.routes.extend(create_agent_card_routes(card))
+    if url:
+        app.router.routes.extend(create_agent_card_routes(card))
+    else:
+        # No fixed public_url: advertise the address the CALLER used. Hermes
+        # a2a_call POSTs to the card's JSONRPC URL, and behind an SSH tunnel
+        # (T289 pattern) that differs from this listener's bind address, so a
+        # fixed URL would send every call to the wrong place. Same rule as the
+        # Hermes adapter's _request_public_url. A spoofed Host only misdirects
+        # the spoofer's own client; it grants nothing (RPC still needs a token).
+        from a2a.server.request_handlers.response_helpers import agent_card_to_dict
+        from starlette.routing import Route
+
+        async def host_card(request):
+            raw = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            host = raw.split(",")[0].strip()
+            if not _CARD_HOST.fullmatch(host):
+                return JSONResponse({"error": "bad host"}, status_code=400)
+            proto = (request.headers.get("x-forwarded-proto") or "http").split(",")[0].strip()
+            scheme = proto if proto in ("http", "https") else "http"
+            served = AgentCard()
+            served.CopyFrom(card)
+            served.supported_interfaces[0].url = f"{scheme}://{host}/"
+            return JSONResponse(agent_card_to_dict(served))
+
+        app.router.routes.append(
+            Route("/.well-known/agent-card.json", host_card, methods=["GET"])
+        )
     app.router.routes.extend(
         create_jsonrpc_routes(handler, "/", context_builder=PeerContext())
     )

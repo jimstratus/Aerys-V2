@@ -209,3 +209,88 @@ def test_action_graph_without_family_fn_is_unchanged():
         {"configurable": {"thread_id": "t"}},
     )
     assert "Family-visible" not in seen["system"]
+
+
+# --- T-25 (11/18): a long text goes as several messages, never cut -------------------------
+
+class _Resp:
+    def __init__(self, body=b'{"id": "chan"}', status=200):
+        self.body, self.status = body, status
+    def read(self, *a):
+        return self.body
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+def _capture(monkeypatch):
+    import io, json as _json, urllib.request
+    sent = []
+    def urlopen(req, timeout=None):
+        sent.append((req.full_url, _json.loads(req.data.decode())))
+        return io.BytesIO(b'{"id": "chan"}') if req.full_url.endswith('/users/@me/channels') else _Resp()
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+    return sent
+
+
+def test_a_long_discord_dm_goes_as_several_messages_with_nothing_cut(monkeypatch):
+    from aerys_v2.kael_line import _discord_dm_send
+    sent = _capture(monkeypatch)
+    report = '\n\n'.join(f'Paragraph {i}: ' + 'word ' * 150 for i in range(6))      # ~4.6k chars
+    _discord_dm_send('token', 'user', report)
+    parts = [body['content'] for url, body in sent if url.endswith('/messages')]
+    assert len(parts) >= 3 and all(len(p) <= 1990 for p in parts)
+    assert ' '.join(' '.join(parts).split()) == ' '.join(report.split())          # every word arrived
+
+
+def test_a_short_dm_is_still_one_message(monkeypatch):
+    from aerys_v2.kael_line import _discord_dm_send
+    sent = _capture(monkeypatch)
+    _discord_dm_send('token', 'user', 'Solved in 3.', silent=True)
+    parts = [body for url, body in sent if url.endswith('/messages')]
+    assert parts == [{'content': 'Solved in 3.', 'flags': 4096}]
+
+
+def test_a_long_telegram_text_goes_as_several(monkeypatch):
+    from aerys_v2.kael_line import _telegram_send
+    sent = _capture(monkeypatch)
+    report = '\n\n'.join(f'Paragraph {i}: ' + 'word ' * 300 for i in range(6))      # ~9k chars
+    _telegram_send('token', 'chat', report)
+    parts = [body['text'] for url, body in sent]
+    assert len(parts) >= 3 and all(len(p) <= 4000 for p in parts)
+
+
+def test_a_rate_limited_part_is_retried_and_nothing_is_sent_twice():
+    """Codex 11/18: a 429 on part 2, then a retry of the whole report, delivered A, A, B."""
+    import urllib.error
+    from aerys_v2.kael_line import _send_parts
+    sent, failures, waited = [], {'B': 1}, []
+    def post(part):
+        if failures.get(part):
+            failures[part] -= 1
+            raise urllib.error.HTTPError('u', 429, 'slow down', {'Retry-After': '2'}, None)
+        sent.append(part)
+    _send_parts(['A', 'B', 'C'], post, sleep=waited.append)
+    assert sent == ['A', 'B', 'C'] and waited == [2.0]
+
+
+def test_a_later_part_that_never_goes_is_said_once_and_the_start_is_not_resent():
+    import urllib.error
+    from aerys_v2.kael_line import REST_DIDNT_SEND, _send_parts
+    sent = []
+    def post(part):
+        if part == 'B':
+            raise urllib.error.HTTPError('u', 500, 'down', {}, None)
+        sent.append(part)
+    _send_parts(['A', 'B', 'C'], post, sleep=lambda s: None)       # returns: no whole-report retry
+    assert sent == ['A', REST_DIDNT_SEND]
+
+
+def test_a_first_part_that_never_goes_raises_so_the_whole_report_can_be_retried():
+    import pytest, urllib.error
+    from aerys_v2.kael_line import _send_parts
+    def post(part):
+        raise urllib.error.HTTPError('u', 429, 'slow down', {'Retry-After': '1'}, None)
+    with pytest.raises(urllib.error.HTTPError):
+        _send_parts(['A', 'B'], post, sleep=lambda s: None)

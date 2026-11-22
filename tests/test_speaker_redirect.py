@@ -47,7 +47,8 @@ def test_office_reply_is_rendered_in_her_voice_and_sent_to_the_desk():
     assert tts_body == {"engine_id": "tts.eleven", "message": "[warmly] That's K-PAX (2001).",
                         "language": "en", "options": {"voice": "arabella"}}   # tags kept, markdown gone
     assert play_url == "http://lev:8410/play" and play_auth == "Bearer spk"
-    assert play_body == {"url": "http://192.168.1.155:8123/api/tts_proxy/x.mp3"}
+    assert {k: v for k, v in play_body.items() if k != "since"} == {"url": "http://192.168.1.155:8123/api/tts_proxy/x.mp3"}
+    assert isinstance(play_body["since"], float)          # 11/13: when its turn began, for the hush floor
 
 
 def test_unmapped_devices_empty_text_and_failures_are_quiet():
@@ -94,3 +95,57 @@ def test_followup_router_sends_office_followups_to_the_desk(monkeypatch):
     assert said == [(OFFICE, "lights are off")] and posts == []      # not the dead speaker
     route("lights are off", "bed")
     assert len(posts) == 1 and posts[0][1]["json"]["entity_id"] == "assist_satellite.bed"
+
+
+def test_callback_waits_for_play_on_background_thread():
+    import threading
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    threads = []
+
+    def handle(request):
+        if request.url.path == "/api/tts_get_url":
+            return httpx.Response(200, json={"url": "http://ha.example/clip.mp3"})
+        threads.append(threading.get_ident())
+        entered.set()
+        if not release.wait(3):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"played": True})
+
+    def then():
+        threads.append(threading.get_ident())
+        finished.set()
+
+    speaker = SpeakerRedirect(
+        ha_base_url="http://ha.example", ha_token="placeholder", engine="tts.example",
+        voice="example", language="en", targets={"sat": "http://speaker.example"},
+        speaker_token="placeholder", client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    speaker.say("sat", "Ready?", then=then)
+    try:
+        assert entered.wait(3)
+        assert not finished.is_set()
+    finally:
+        release.set()
+    assert finished.wait(3)
+    assert len(threads) == 2 and threads[0] == threads[1] != threading.get_ident()
+
+
+def test_callback_failure_is_debug_only(caplog):
+    import logging
+
+    def handle(request):
+        return httpx.Response(200, json={"url": "http://ha.example/clip.mp3", "played": True})
+
+    def then():
+        raise RuntimeError("callback failed")
+
+    speaker = SpeakerRedirect(
+        ha_base_url="http://ha.example", ha_token="placeholder", engine="tts.example",
+        voice="example", language="en", targets={"sat": "http://speaker.example"},
+        speaker_token="placeholder", client=httpx.Client(transport=httpx.MockTransport(handle)),
+        async_send=False,
+    )
+    with caplog.at_level(logging.DEBUG, logger="aerys_v2.speaker_redirect"):
+        speaker.say("sat", "Ready?", then=then)
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)

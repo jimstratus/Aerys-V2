@@ -151,11 +151,12 @@ def test_play_prefers_tracks_and_reports_resolved_name():
     ha = FakeHA()
     tool = make_tool(ha)
     tool.invoke({"operation": "play", "query": "one more time"}, config=cfg(OFFICE_DEV))
-    play = next(b for p, b in ha.calls if p.endswith("/play_media"))
-    assert play["media_id"] == "spotify://track/t1"
-    assert play["media_type"] == "track"
-    # single-track asks keep the music going (owner call, 2026-07-18)
-    assert play["radio_mode"] is True
+    plays = [b for p, b in ha.calls if p.endswith("/play_media")]
+    # the song alone first (11/14: shuffle can't bury it), then its radio after it, so a single-track
+    # ask keeps the music going (owner call, 2026-07-18)
+    assert plays[0] == {"entity_id": "media_player.office_satellite", "media_id": "spotify://track/t1",
+                        "media_type": "track", "enqueue": "replace"}
+    assert plays[1] == {**plays[0], "enqueue": "add", "radio_mode": True}
 
 
 def test_playlist_play_keeps_natural_scope_no_radio_mode():
@@ -255,7 +256,7 @@ def test_now_playing_reads_without_ok_prefix():
 def test_unknown_operation_lists_valid_ones():
     ha = FakeHA()
     tool = make_tool(ha)
-    out = tool.invoke({"operation": "shuffle"}, config=cfg(OFFICE_DEV))
+    out = tool.invoke({"operation": "unknown_example"}, config=cfg(OFFICE_DEV))
     assert "Unknown operation" in out and "now_playing" in out
 
 
@@ -304,8 +305,9 @@ def test_failed_radio_mode_retries_the_plain_track_then_the_next_candidate():
     ha = RadioDead()
     out = make_tool_with(ha).invoke({"operation": "play", "query": "one more time", "device_id": OFFICE_DEV})
     plays = [b for p, b in ha.calls if p.endswith("/play_media")]
-    assert plays[0].get("radio_mode") is True and plays[1] == {
-        "entity_id": "media_player.office_satellite", "media_id": "spotify://track/t1", "media_type": "track"}
+    assert plays[0] == {"entity_id": "media_player.office_satellite", "media_id": "spotify://track/t1",
+                        "media_type": "track", "enqueue": "replace"}
+    assert plays[1].get("radio_mode") is True and len(plays) == 2      # radio failed: the song still plays
     assert out.startswith(WRITE_OK_PREFIX) and "just the song" in out
 
 
@@ -314,3 +316,24 @@ def test_every_candidate_failing_is_one_honest_line_with_what_was_tried():
     out = make_tool_with(ha).invoke({"operation": "play", "query": "one more time", "device_id": OFFICE_DEV})
     assert out.startswith("Starting music on") and "FAILED" in out and "Tried:" in out
     assert "One More Time" in out and "Daft Punk" in out
+
+
+def test_d54_a_run_he_isnt_in_never_changes_a_speaker_on_his_blocklist():
+    # Codex 11/15: the blocklist was checked on the raw target only, so music was never checked at
+    # all. Now it's checked on the speaker the target RESOLVED to, named or picked as the one playing.
+    from aerys_v2 import wakeups as wk
+
+    ha = FakeHA()
+    tool = make_tool(ha)
+    wake = {"configurable": {"identity": {"user_id": "person-1", "platform": "wake", "unattended": True}}}
+    try:
+        wk.set_autonomy_blocked("office satellite")
+        assert tool.invoke({"operation": "pause", "target": "office"}, config=wake) == wk.NOT_ON_ITS_OWN
+        assert tool.invoke({"operation": "volume", "target": "office satellite", "query": "20"},
+                           config=wake) == wk.NOT_ON_ITS_OWN
+        assert not any(p.startswith("/api/services/media_player/") and "office" in str(b.get("entity_id"))
+                       for p, b in ha.calls)
+        assert tool.invoke({"operation": "now_playing", "target": "office"}, config=wake).find("One More Time") >= 0
+        assert tool.invoke({"operation": "pause", "target": "office"}, config=cfg()).startswith(WRITE_OK_PREFIX)
+    finally:
+        wk.set_autonomy_blocked("")

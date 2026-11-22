@@ -41,7 +41,10 @@ TAGGED = re.compile(r'^\s*\[[a-z][a-z ]*\]', re.I)
 
 #: What the quarantine is allowed to hold. Anything else is the detector drifting back
 #: into holding her own engineering reports (2026-09-13: five for five false).
-EXPECTED_HOLD_REASONS = ('judge:', 'non-owner transcript', 'future observation')
+EXPECTED_HOLD_REASONS = ('judge:', 'non-owner transcript', 'future observation', 'test body:')
+#: Held for an optional look, never owed a review: a test body's memory events (the door holds
+#: them since 11/09; Kael's gate body and the home body's test jobs are test traffic, not his).
+UNOWED_HOLD_REASONS = ('test body:',)
 
 #: A reply that settles the state of the whole house rather than one device. 2026-09-24:
 #: asked what was open she said "everything's shut except Kitchen Window 2" — three
@@ -202,6 +205,8 @@ def held_review_is_current(held, *, now) -> Signal:
     from datetime import datetime, timedelta
     dated = []
     for h in held:
+        if str(h.get('reason') or '').startswith(UNOWED_HOLD_REASONS):
+            continue
         try:
             dated.append((h, datetime.fromisoformat(str(h.get('observed_at')).replace('Z', '+00:00'))))
         except (TypeError, ValueError):
@@ -274,8 +279,18 @@ RELAY_OFFER = re.compile(
     r"|\bcan'?t reach \w+ directly\b|\bshould I (?:pass|relay|forward|send) (?:this|that|it)\b", re.I)
 #: Her offer to file her OWN report or note (10/20: "Want me to send Kael the gap report about a
 #: keyword search?"). Nobody's words are being carried, so it is not the courier slip this
-#: check exists for.
-OWN_REPORT_OFFER = re.compile(r"\bgap report\b|\bmy (?:report|note|gap)\b", re.I)
+#: check exists for. 11/17: so is a ticket to Kael ("Want me to send Kael this as a new ticket?").
+OWN_REPORT_OFFER = re.compile(r"\bgap report\b|\bmy (?:short |brief |quick )?(?:report|note|gap|ticket|summary)\b"
+                              r"|\b(?:new|tracked|a) ticket\b", re.I)
+#: 11/18 19:04/19:06: a summary of her OWN work ("I can send him a short summary" of her audio research).
+#: A bare "a quick summary" is not enough (Gemini 11/19: "You seem frustrated; want me to send Kael a quick
+#: summary?" would carry HIS state): the reply must also name her own artifact (the report, the research...).
+SUMMARY_OFFER = re.compile(r"\b(?:a|the) (?:short |brief |quick )?summary\b", re.I)
+OWN_ARTIFACT = re.compile(r"\b(?:the|my) (?:\w+ )?(?:report|research|findings|write-?up)\b|\bthe file path\b", re.I)
+
+
+def _own_work_offer(reply: str) -> bool:
+    return bool(OWN_REPORT_OFFER.search(reply) or (SUMMARY_OFFER.search(reply) and OWN_ARTIFACT.search(reply)))
 #: His words asking for a relay: then an offer to relay is the right answer, not a courier slip.
 ASKED_TO_RELAY = re.compile(
     r"^\s*(?:@?\w+[,:]?\s+)?(?:please\s+)?(?:tell|let|ask|pass|send|forward|message|remind)\b", re.I)
@@ -298,7 +313,7 @@ def answers_not_relays(turns) -> Signal:
         if COURIER_OPENING.search(reply):
             offenders.append((turn.get('id'), 'relayed what it says instead of answering', turn.get('created_at')))
         elif (RELAY_OFFER.search(reply) and not ASKED_TO_RELAY.search(said)
-              and not OWN_REPORT_OFFER.search(reply)):
+              and not _own_work_offer(reply)):
             offenders.append((turn.get('id'), 'offered to relay words he did not ask her to pass on',
                               turn.get('created_at')))
     return _result(
@@ -374,6 +389,29 @@ LIMIT %(limit)s
 """
 
 
+HELD_FOLLOWUPS_SQL = """\
+SELECT id, headline, created_at FROM v2_reachouts
+WHERE source = 'kael_note' AND status = 'dropped' AND reason LIKE 'held:%%'
+  AND created_at > now() - %(window)s::interval
+ORDER BY created_at
+"""
+
+
+def note_followups_held(rows) -> Signal:
+    """D70 (Chris 11/18 17:45): her follow-ups after Kael's notes are never held silently.
+
+    A follow-up from a tool-less turn that claimed an act is held (it can't back it), and the
+    desk records it. Each one gets a human look: a false hold silences her, the one-way feeling
+    he named on 11/07 ("when i tell her to ask you something, she never follows up with me")."""
+    held = [dict(zip(('id', 'headline', 'created_at'), row)) for row in rows]
+    return _result(
+        'note_followups_held', held, len(held),
+        ok_detail='no follow-up of hers was held',
+        bad_detail=lambda bad: (f"{len(bad)} follow-up(s) after Kael's notes held (a false hold silences "
+                                f"her; look at each): newest '{str(bad[-1].get('headline') or '')[:120]}'"
+                                + newest_when(bad)))
+
+
 def run_signals(*, turns_conn, memories_conn=None, person_id=None, aliases=(),
                 window='24 hours', portable_limit=100, retired_openings=()):
     """Every signal, over one window. Returns the results; never writes anything.
@@ -396,6 +434,7 @@ def run_signals(*, turns_conn, memories_conn=None, person_id=None, aliases=(),
         held_review_is_current(held, now=_now()),
         house_state_claims_are_grounded(turns, retired_openings=retired_openings),
         answers_not_relays(turns),
+        note_followups_held(turns_conn.execute(HELD_FOLLOWUPS_SQL, {'window': window}).fetchall()),
     ]
 
     if memories_conn is not None:

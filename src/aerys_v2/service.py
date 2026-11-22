@@ -32,6 +32,7 @@ import json
 import logging
 import re
 from collections import deque
+import random
 import threading
 import time
 import uuid
@@ -45,6 +46,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from aerys_v2.factory import LOCAL_FALLBACK_FIRED, track_local_tool_fallback
 from aerys_v2.history import window_messages
+from aerys_v2.services.location_guard import LOCATION_TURN
+from aerys_v2.services.presence import TRAVEL_ZONE
 from aerys_v2.tools.remember import CURRENT_TURN_TEXT
 from aerys_v2.router import (
     DEFAULT_TIER,
@@ -61,8 +64,9 @@ from aerys_v2.services.content_privacy import (
     SEALED_ROOM_KEY,
     gate_for_room,
 )
-from aerys_v2.state import Identity, is_lens_surface, is_voice_turn
+from aerys_v2.state import VOICE_OWNER_ASSUMED_KEY, Identity, is_lens_surface, is_voice_turn
 from aerys_v2.turns import (
+    ACTION_NO_TOOL_CORRECTION,
     build_turn_row, channel_enum, current_trace_id, derive_channel, extract_tool_calls,
 )
 from aerys_v2.reflex import REFLEX_LAST_REPLY, REFLEX_RECENT, REFLEX_ROOM, REFLEX_SINCE_S, LAST_REFLEX, REFLEX_SURFACE, error_result
@@ -144,7 +148,7 @@ def _origin_privacy(identity: Identity | dict | None) -> str:
 
 
 def _human_turn(
-    text: str, origin_privacy: str, msg_id: str, *, sealed_room: str = ""
+    text: str, origin_privacy: str, msg_id: str, *, sealed_room: str = "", owner_assumed: bool = False
 ) -> HumanMessage:
     """A tagged HumanMessage with a STABLE id — the id lets the async judge retag THIS
     exact message later (add_messages replaces by id, in place). A turn said in a
@@ -152,10 +156,23 @@ def _human_turn(
     (content_privacy.redact_sealed_history). Every writer passes the room it has, the
     retag included: replacing a message by id with a copy that lacked the room would
     quietly unseal it."""
-    kwargs = {CONTENT_PRIVACY_KEY: origin_privacy}
+    from aerys_v2.services.said_when import SAID_AT_KEY, said_at_now
+
+    # T-6: when it was said, so "tomorrow" is read against that day (services/said_when.py).
+    kwargs = {CONTENT_PRIVACY_KEY: origin_privacy, SAID_AT_KEY: said_at_now()}
     if sealed_room:
         kwargs[SEALED_ROOM_KEY] = sealed_room
+    if owner_assumed:
+        # D2/D43: a voice that was his by default only. Kept on the message, so a later turn never
+        # counts these words as his own (_remember_window); every writer passes it, the retag included.
+        kwargs[VOICE_OWNER_ASSUMED_KEY] = True
     return HumanMessage(content=text, id=msg_id, additional_kwargs=kwargs)
+
+
+def _owner_assumed(config: dict | None) -> bool:
+    """Was this turn his by default only (the unsure band, an untagged or carried voice)?"""
+    identity = ((config or {}).get("configurable") or {}).get("identity") or {}
+    return bool(identity.get(VOICE_OWNER_ASSUMED_KEY))
 
 
 def _sealed_room(config: dict | None) -> str:
@@ -273,6 +290,11 @@ def _fire_turn_record(
         reflex = LAST_REFLEX.get(None)
     try:
         configurable = (config or {}).get("configurable") or {}
+        outside = configurable.get("outside_text") or {}
+        if outside.get("untrusted_read") or outside.get("origin") or (configurable.get("room_sink") or {}).get("outside"):
+            fields["extra_degraded"] = list(dict.fromkeys([*(fields.get("extra_degraded") or []), "untrusted_read"]))
+        if outside.get("guard_error"):   # the guard itself failed (and refused): a real gap, never by-design
+            fields["extra_degraded"] = list(dict.fromkeys([*(fields.get("extra_degraded") or []), "outside_guard_failed"]))
         row = build_turn_row(
             thread_id=str(configurable.get("thread_id", "")),
             identity=configurable.get("identity") or {},
@@ -464,8 +486,28 @@ def _reclassify_content_privacy(
     the SAFE 'private' tag in place. Worst case a general DM message never carries into
     public (conservative), never a private one leaking."""
 
+    # Capture THIS turn before starting the daemon; later asks get a fresh marker.
+    location_marker = LOCATION_TURN.get()
+
     def run() -> None:
         try:
+            from aerys_v2 import factory
+            from aerys_v2.services.location_guard import recent_location_turn
+
+            person_id = (config.get("configurable", {}).get("identity") or {}).get("user_id")
+            if factory._OWNER_ID and person_id == factory._OWNER_ID:
+                if location_marker or recent_location_turn(person_id):
+                    return
+                presence_fn = getattr(graph, "presence_fn", None)
+                if presence_fn is None:
+                    return
+                try:
+                    whereabouts = getattr(presence_fn(), "whereabouts", None)
+                    if not whereabouts or whereabouts[0] != "home":
+                        return
+                except Exception:
+                    return  # no traceback: presence exceptions may contain location
+
             if classifier(f"{text}\n{reply}") != PUBLIC:
                 return  # judge kept it private — the ingest tag already is; nothing to do
             configurable = config["configurable"]
@@ -473,7 +515,8 @@ def _reclassify_content_privacy(
             for _ in range(_RETAG_MAX_ATTEMPTS):
                 graph.update_state(
                     {"configurable": configurable},
-                    {"messages": [_human_turn(text, PUBLIC, msg_id, sealed_room=_sealed_room(config))]},
+                    {"messages": [_human_turn(text, PUBLIC, msg_id, sealed_room=_sealed_room(config),
+                                              owner_assumed=_owner_assumed(config))]},
                     as_node="chat",
                 )
                 if _retag_landed(graph, configurable, msg_id):
@@ -516,14 +559,13 @@ def _reclassify_if_needed(
 class Rails:
     """Per-request safety limits (cross-review #13) — enforced at the seam, not by prompts.
 
-    turn_limit went live with the TOOLS block: with tools wired, a confused model
-    can loop tool-call → result → tool-call forever; the rail (as LangGraph's
-    recursion_limit) makes the 10th hop a hard stop instead of an Opus-budget
-    incineration.
+    turn_limit bounds LangGraph super-steps: owner turns default to 60.
+    ask() caps non-owner turns at 10, including allowlisted guests and callers
+    without a configured owner. The wall-clock budget is independent.
     """
 
     wall_clock_s: float = 90.0
-    turn_limit: int = 10
+    turn_limit: int = 60
 
 
 class TurnTimeout(RuntimeError):
@@ -612,8 +654,8 @@ def _remember_window(seed: list, text: str) -> str:
     """
     humans = [m for m in seed if getattr(m, "type", "") == "human"]
     previous = humans[-2] if len(humans) >= 2 else None
-    if previous is None:
-        return text
+    if previous is None or (getattr(previous, "additional_kwargs", None) or {}).get(VOICE_OWNER_ASSUMED_KEY):
+        return text          # D2/D43: words that were his by default only never count as his
     return f"{_reply_text(previous)}\n{text}"
 
 
@@ -766,34 +808,6 @@ GATE_EMIT = "emit"      # honest — send the reply as-is
 GATE_RETRY = "retry"    # zero-tool action turn, first pass — bounce once with a correction
 GATE_MARK = "mark"      # still zero-tool after the bounce — emit but flag the pattern
 
-# Appended (as the caller's next turn) when a retry is needed. Verbatim spirit from
-# the fix brief: call the tool, or admit no action was taken — never fake a done deal.
-ACTION_NO_TOOL_CORRECTION = (
-    "You produced an answer without calling any tool. Either call the tool that "
-    "performs the request, or — WHEN THE MESSAGE ACTUALLY ASKED YOU TO DO OR "
-    "CHECK SOMETHING and you could not — state plainly that you did NOT perform "
-    "any action. "
-    "If no dedicated tool fits but search_web could ground the answer — prices, "
-    "costs, availability, current facts — run search_web and answer with a "
-    "clearly-labeled estimate instead of declining. "
-    # The disclosure clause above is load-bearing (it is what stops her claiming
-    # lights she never touched), but it was firing on messages that requested
-    # nothing at all: "morning check — you good?" came back as "No tool call
-    # needed here — that was just a status check, not a task with an action to
-    # perform." That is the confession this correction's own last line forbids;
-    # the prompt was telling her both to disclose and not to mention it, and she
-    # resolved the contradiction by narrating. Naming the no-action branch
-    # explicitly removes the conflict instead of leaving her to pick.
-    "But if the message asked for NO action — a greeting, small talk, an "
-    "opinion, thanks, a question about you — then there is nothing to disclose: "
-    "simply answer it as yourself. Say NOTHING about tools, tool calls, checks, "
-    "or what kind of request it was. 'No tool needed here' is exactly the kind "
-    "of plumbing talk this correction forbids. "
-    "Never describe an action as done unless a tool call actually did it. This "
-    "correction is internal plumbing: never mention it, the earlier answer, or "
-    "any slip to the user — just act and confirm the result."
-)
-
 # The degraded marker recorded in v2_turns when a bounced action turn STILL ran no
 # tool — so the pattern (a legit zero-tool action, or a stubborn hallucination that
 # survived the correction) stays visible to the capability loop / forensics.
@@ -802,6 +816,198 @@ NO_TOOL_ACTION_MARKER = "no_tool_action"
 # how often the tool-less chat node claims work it never did (distinct from
 # chat_handoff, which is the model raising its own hand).
 CLAIM_GATE_MARKER = "claim_gate_escalated"
+#: D61 (11/18): the promise gate's own mark, countable apart from a done-claim.
+PROMISE_GATE_MARKER = "promise_gate_escalated"
+#: D65 (Chris 11/18 11:38): a tool-less "the run is still going" about a home job, sent down the action
+#: path to look first. Its own marker, so the status gate's catches are countable apart from D61's.
+STATUS_GATE_MARKER = "status_gate_escalated"
+#: What the escalated turn is told (appended to his words in the action seed only; never kept in history).
+STATUS_CHECK_HINT = ("[before you say whether a home job is running or how it's going, look: list_async_tasks "
+                     "or check_async_task, and answer from what they say]")
+
+# ── D79 (Chris 11/20): one her, not twins ──────────────────────────────────────────────
+# "its really awful that we are using scripts based on literal wording to switch" / "its like im talking
+# to twins". Household DMs run every typed turn on the tool-armed action graph, the way voice has since
+# 2026-07-25 (VOICE-ALWAYS-ACTION): the router's verdict picks only the shape of the reply. Behind a flag
+# that starts off (text_one_loop_flag), so flag off is the old split.
+#: Every one-loop row carries it, so the switch's turns are countable apart from the old chat path's.
+ONE_LOOP_MARKER = "text_one_loop"
+#: The served tier when the router asked for another: banter rides her conversational model (standard).
+ONE_LOOP_TIER_SOURCE = "one_loop"
+#: D79 (Codex 11/20 #3, re-check #3): what she did this turn is read from the tool receipts, each sorted by
+#: what it does: send, start, record, device or read. A claim is backed only by a COMPLETED receipt of its
+#: own kind. Names are every tool the main action graph binds as action_stack_for builds it, fully armed:
+#: action_tools_for plus the home-job, send-file and skill-file middleware tools (the D79 replay, turn 3069,
+#: ran write_file and send_file_to_chris; tests/test_d79_text_one_loop.py builds that graph and checks each
+#: bound name is sorted here).
+ONE_LOOP_SEND = frozenset({"send_message", "send_email", "message_kael", "send_file_to_chris"})
+ONE_LOOP_START = frozenset({"start_async_task", "update_async_task", "continue_home_job"})
+#: Stopping a home job: an act, but not a start (it backs "I stopped it", never "I started it").
+ONE_LOOP_STOP = frozenset({"cancel_async_task"})
+#: Tools that only read.
+ONE_LOOP_READ_ONLY = frozenset({
+    "analyze_image", "calendar_events", "get_weather", "messages_sent", "no_action", "read_document",
+    "read_email", "read_his_email", "read_my_code", "read_web_page", "search_email", "search_entities",
+    "search_his_email", "search_web", "where_is_chris_nearby", "youtube_summary", "check_async_task",
+    "list_async_tasks", "files_sent_to_chris", "ls", "read_file",
+})
+#: Tools that keep a record (memory, a note, a list, a draft, a link) and no other kind of act.
+ONE_LOOP_RECORD = frozenset({"remember", "log_gap", "sticky_note", "save_contact_email", "draft_email",
+                             "draft_in_his_gmail", "add_to_cart_link", "write_file", "edit_file"})
+#: Tools that change something in the house, and nothing else.
+ONE_LOOP_DEVICE = frozenset({"keep_listening"})
+#: Tools that read or act by their operation (the tool's own argument names, from its code): which
+#: operations read, and what every other operation is. An operation not named in `reads` is the default kind.
+ONE_LOOP_BY_OPERATION = {
+    "home_control": {"arg": "operation", "reads": {"get_state", "history"}, "default": {"device"}},
+    "music": {"arg": "operation",
+              "reads": {"recently_played", "queue", "my_playlists", "my_taste", "up_next", "now_playing"},
+              "record": {"like", "add_to_library", "new_playlist", "add_to_playlist"},
+              "default": {"device"}},
+    "timer": {"arg": "action", "reads": set(), "default": {"device"}},
+    "control_alarm": {"arg": "action", "reads": {"status"}, "default": {"device"}},
+    "kael_tickets": {"arg": "action", "reads": {"check", "list"}, "default": {"send", "record"}},
+    "manage_list": {"arg": "action", "reads": {"show"}, "default": {"record"}},
+    "kael_checkins": {"arg": "action", "reads": {"list"}, "default": {"record"}},
+    "reach_prefs": {"arg": "action", "reads": {"show"}, "default": {"record"}},
+    "my_pending_requests": {"arg": "action", "reads": {"list"}, "default": {"record"}},
+    "wake_me": {"arg": "action", "reads": {"list"}, "default": {"record"}},
+    "check_back": {"arg": "action", "reads": {"list"}, "default": {"record"}},
+}
+#: The correction for a claim or promise nothing backs, on a pass that may still use tools (nothing was
+#: done yet this turn).
+ONE_LOOP_CLAIM_CORRECTION = (
+    "Your answer said something was done, sent, started or checked, or that you would do it now, and this "
+    "turn's tool results don't show it. Answer again from what your tools actually did: do it now with the "
+    "right tool, or say plainly that it isn't done."
+)
+#: The same on a reply-only pass (something was already done this turn): words only, no more tools.
+ONE_LOOP_REPLY_ONLY_CORRECTION = (
+    "Your answer claimed something that this turn's tool results don't show. Answer again in words only, "
+    "from what is listed above as done: say plainly what was done and what wasn't. You can't do anything "
+    "more in this reply."
+)
+#: What her one-loop reply is told when it says a home job is running without having looked.
+ONE_LOOP_STATUS_CORRECTION = (
+    "You said how a home job stands without looking. Look first with list_async_tasks or check_async_task, "
+    "then answer from what they say."
+)
+#: Marker when his words and her reply could not be written to the thread (the row still records the turn).
+ONE_LOOP_LAND_FAILED = "history_write_failed"
+#: What he reads when a one-loop turn fails in a way that isn't a rate limit (one exchange on every exit).
+ONE_LOOP_FAILURE_LINE = "Something went wrong on my side before I could finish that, so I stopped."
+#: How each act reads in his words when a failed turn says what already went through (Codex re-check #4).
+ONE_LOOP_ACT_WORDS = {
+    "send_message": "the message", "send_email": "the email", "message_kael": "the note to Kael",
+    "start_async_task": "the home job", "update_async_task": "the change to the home job",
+    "continue_home_job": "the go-ahead for the home job", "cancel_async_task": "stopping the home job",
+    "send_file_to_chris": "the file", "write_file": "the file change", "edit_file": "the file change",
+    "home_control": "the house change", "music": "the music change", "timer": "the timer",
+    "control_alarm": "the alarm change", "remember": "the note to my memory", "sticky_note": "the Sticky note",
+    "manage_list": "the list change", "kael_tickets": "the update to Kael's ticket", "wake_me": "the wake-up",
+    "check_back": "the check-back", "log_gap": "the gap report", "save_contact_email": "the contact's email",
+    "draft_email": "the draft", "draft_in_his_gmail": "the Gmail draft", "add_to_cart_link": "the cart link",
+}
+#: Policy outcomes, by the first line of a tool's answer (hands_gate, outside_guard, the tools' own refusals).
+_ONE_LOOP_PENDING_RE = re.compile(
+    r"^\s*(?:waiting for|still waiting|chris approved|that'?s already being done)", re.I)
+_ONE_LOOP_REFUSED_RE = re.compile(
+    r"^\s*(?:not (?:done|sent|saved|started|added|changed|set|played|scheduled|allowed|withdrawn|"
+    r"logged|kept|created)\b|not delivered\b(?! yet)|draft not created\b|nothing was kept\b|"
+    r"couldn'?t change it\b|only (?:he|the owner|chris) can\b|i'?m not sure it'?s him\b|refused\b|"
+    r"chris said no\b|nothing (?:was|has been) (?:done|sent)|that exact message already went)"
+    r"|\bnothing happened\b|\bnothing (?:went|was sent|changed)\b", re.I)
+#: Codex second re-check #1: an act counts as done only on the tool's own words for success (read from each
+#: live tool's code), never by default. Each rule: a pattern on the tool's answer and the kinds it completes;
+#: every matching rule adds its kinds (a cart link can be made AND sent). Anything else is not done.
+_ONE_LOOP_DONE_WORDS = {
+    "send_message": ((r"^Sent:", {"send"}),),
+    "send_email": ((r"^Sent: email\b", {"send"}),),
+    "message_kael": ((r"^Delivered\b", {"send"}),
+                     (r"^NOT DELIVERED YET:.*\bsaved as ticket\b", {"record"})),   # kept, not delivered
+    "remember": ((r"^(?:Kept|Already kept):", {"record"}),),
+    "log_gap": ((r"^Logged\b", {"record"}),),
+    "sticky_note": ((r"^Note is up\b", {"record"}),),
+    "save_contact_email": ((r"^Saved:", {"record"}),),
+    "draft_email": ((r"^DRAFT \(not sent\):", {"record"}),),
+    "draft_in_his_gmail": ((r"^Drafted:", {"record"}),),
+    "add_to_cart_link": ((r"^https://", {"record"}), (r"(?m)^Sent the link to his Discord DM\.", {"send"})),
+    "keep_listening": ((r"^Keep listening is (?:on|off)\b", {"device"}),),
+    "timer": ((r"^Timer set for\b", {"device"}), (r"\bI started a background\b", {"device"}),
+              (r"^Done:", {"device"}), (r"^Cancelled the background timer\b", {"device"})),
+    "control_alarm": ((r"^Alarm \w+ sent\b", {"device"}),),
+    "home_control": ((r"^Done:", {"device"}),),
+    "manage_list": ((r"^(?:Added to|Removed from|Checked off on) the\b", {"record"}),),
+    "kael_tickets": ((r"^Added to T-\d+; Kael has it now\b", {"send", "record"}),
+                     (r"^Added to T-\d+, but Kael's line didn't take it\b", {"record"}),   # kept, not delivered
+                     (r"^Canceled T-\d+\b", {"record"})),           # its note to Kael is never checked
+    "kael_checkins": ((r"^(?:Stopped|Resumed) [^:\n]+:", {"record"}),),
+    "reach_prefs": ((r"^(?:Changed:|Holding:|Discreet:|The nap hold is off\b|Company's gone\b)", {"record"}),),
+    "my_pending_requests": ((r"^Withdrawn request #\d+", {"record"}),),
+    "wake_me": ((r"^(?:Set:|Canceled:|Paused:|Resumed:|Running wake-up #|Updated:)", {"record"}),),
+    "check_back": ((r"^(?:Set:|Canceled:)", {"record"}),),
+    "start_async_task": ((r"^Launched async subagent\b", {"start"}),),
+    "update_async_task": ((r"^(?:Updated async subagent|Queued follow-up to async subagent)\b", {"start"}),),
+    "continue_home_job": ((r"^(?:Updated async subagent|Queued follow-up to async subagent|"
+                           r"The continuation was queued)\b", {"start"}),),
+    "cancel_async_task": ((r"^Cancelled async subagent task\b", {"stop"}),),
+    "send_file_to_chris": ((r"^(?:ALREADY )?SENT:", {"send"}),),     # already sent: it is in his DM
+    "write_file": ((r"^Updated file ", {"record"}),),          # outside_guard's own test of a write
+    "edit_file": ((r"^Successfully replaced ", {"record"}),),
+}
+#: music's acts answer "Done: …" on success (WRITE_OK_PREFIX), DJ breaks their own line (dj.set_enabled); what
+#: kind they are comes from the operation.
+_ONE_LOOP_MUSIC_DONE = re.compile(r"^(?:Done:|DJ breaks are (?:back on|off)\b)")
+#: A read's own refusal ("Couldn't read his email…", "His library is his…"): not a completed look.
+_ONE_LOOP_READ_REFUSED = re.compile(
+    r"^\s*(?:couldn'?t|i couldn'?t|i could not|can'?t|cannot|not here\b|not available\b|only (?:he|the owner|chris)\b|"
+    r"his library is his|i'?m not sure it'?s him|refused\b|not done\b|unknown\b|use \w+ to read\b|"
+    r"location request refused|current location is unavailable|give search_for\b|search for at least\b|"
+    r"\w+ needs (?:a|an|the|some)\b|[\w ']{0,40}\b(?:failed|is unreachable|unavailable|came back malformed)\b|"
+    r"[\w ]{0,30}: not available\b)", re.I)
+
+
+def text_one_loop_eligible(identity: dict, action_allowlist, owner_id: str = "") -> bool:
+    """D79: may this typed turn take the one loop? Only a resolved HOUSEHOLD identity on an actual DM
+    surface (Discord or Telegram, channel_kind 'dm'). Never a shared room, a guest, a cold handle, voice
+    or the lens, or a surface with no platform. Household = the action allowlist (owner + the people Chris
+    added); with no allowlist (a dev box) only the configured owner. Called AFTER ask()'s allowlist gate,
+    and it checks the allowlist itself, so it can never hand a guest the privileged graph (Codex 11/20)."""
+    identity = identity or {}
+    if identity.get("voice") or is_lens_surface(identity):
+        return False
+    if str(identity.get("platform") or "").lower() not in ("discord", "telegram"):
+        return False
+    if str(identity.get("channel_kind") or "").lower() != "dm":
+        return False
+    user = str(identity.get("user_id") or "")
+    if not user or ":" in user:          # a cold '{platform}:{id}' handle is a stranger
+        return False
+    if action_allowlist is not None:
+        return user in action_allowlist
+    return bool(owner_id) and user == str(owner_id)
+
+
+def text_one_loop_flag(settings) -> Callable[[], bool]:
+    """The switch, read on every turn: the file (settings.text_one_loop_file) when it exists and says
+    on/off, else settings.text_one_loop. The file lets a deploy flip it without recreating a container
+    (the way ~/bench/text-loop picks the engine); an unreadable or empty file falls back to the setting."""
+    path = str(getattr(settings, "text_one_loop_file", "") or "").strip()
+
+    def read() -> bool:
+        if path:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    word = fh.read().strip().lower()
+            except OSError:
+                word = ""
+            if word in ("on", "true", "1", "yes"):
+                return True
+            if word in ("off", "false", "0", "no"):
+                return False
+        return bool(getattr(settings, "text_one_loop", False))
+
+    return read
 
 # False-wake grace (owner ask 2026-08-27): the router judged this voice/lens
 # capture was never directed at Aerys and the turn was dropped — no reply, no
@@ -976,6 +1182,8 @@ def action_honesty_gate(
 def _invoke_action_graph(action_graph: object, messages: list, config: dict) -> dict:
     # Bring the tool-node receipt back across LangGraph's copied context, even
     # if the local model fails too. The caller resets the flag once per turn.
+    config = {**config, "configurable": {**config.get("configurable", {}),
+                                       "action_context_memo": {}}}
     with track_local_tool_fallback():
         return action_graph.invoke({"messages": messages}, config)
 
@@ -985,6 +1193,7 @@ def _run_action_gated(
 ) -> tuple[dict, list[str]]:
     """Invoke the action graph, then enforce the action-honesty gate.
 
+    The agent engine retries inside its model wrapper; legacy graphs re-invoke.
     Returns (result, extra_degraded). An action turn that ran ZERO tools is bounced
     ONCE — the graph is re-invoked with its own no-tool answer plus a corrective
     message appended — and if it STILL runs no tool, extra_degraded carries
@@ -994,6 +1203,15 @@ def _run_action_gated(
     never again emitting a fabricated "done" (fix brief, 2026-07-12)."""
     route = config.get("configurable", {}).get("specialist_route", "action")
     routes = (route,)
+    if getattr(action_graph, "action_loop", None) == "agent":
+        config = {**config, "configurable": {**config.get("configurable", {}), "honesty_gate": True}}
+        result = _invoke_action_graph(action_graph, seeded_messages, config)
+        retried = any(isinstance(m, HumanMessage) and m.content == ACTION_NO_TOOL_CORRECTION
+                      for m in result["messages"])
+        verdict = action_honesty_gate(
+            route, extract_tool_calls(result["messages"]), already_retried=retried, specialists=routes
+        )
+        return result, [NO_TOOL_ACTION_MARKER] if verdict == GATE_MARK else []
     result = _invoke_action_graph(action_graph, seeded_messages, config)
     verdict = action_honesty_gate(
         route, extract_tool_calls(result["messages"]), already_retried=False, specialists=routes
@@ -1102,8 +1320,8 @@ def _honest_reply_for_failure(exc: BaseException) -> str | None:
     reply. The rail is doing its job; the caller still deserves a sentence."""
     if isinstance(exc, GraphRecursionError):
         return (
-            "I went in circles on that one and stopped myself — the reading never "
-            "came together. Ask me again in a moment, or tell me which device to look at."
+            "I ran out of steps before finishing that one. "
+            "Ask me again, or narrow it down a little."
         )
     return rate_limit_reply(str(exc) or type(exc).__name__)
 
@@ -1135,6 +1353,7 @@ def ask(
     drop_conversation_window_s: float = 180.0,
     activity_registry: dict[str, float] | None = None,
     trace_payloads: bool = True,
+    text_one_loop: bool | Callable[[], bool] = False,
 ) -> str:
     """Run one conversational turn and return the reply text.
 
@@ -1170,7 +1389,7 @@ def ask(
       disclosing presence is. The memory boundary makes a stranger's identity COLD
       (no memories) but does NOTHING to the tools — so this gate is the one thing
       between a guild member and the owner's house. The owner is always in the set;
-      more can be added by config (e.g. Megan) with no code change
+      more can be added by config (e.g. his wife) with no code change
       (factory.action_allowlist_for). None = unenforced (dev boxes).
     - guest_action_graph: the reduced action graph (media tools only) used for
       non-allowlisted callers, from factory.guest_action_graph_for. None = they get
@@ -1193,6 +1412,9 @@ def ask(
       private-CONTENT things never do. None = feature off: DM turns stay 'private' and
       simply never carry into public. Never touches latency (daemon thread) and never
       loosens the public-origin path (those turns are already 'public').
+    - text_one_loop: D79's switch (a bool, or text_one_loop_flag(settings), read per turn).
+      On, a chat-routed typed turn from a household DM runs the tool-armed action graph as
+      conversation (_text_one_loop_turn) instead of the tool-less chat graph. Off = unchanged.
     """
     if not text or not text.strip():
         raise ValueError("ask() requires non-empty text")
@@ -1211,11 +1433,15 @@ def ask(
     # The remember tool grades trust by comparing a kept fact against what the
     # owner said THIS turn; every ask() sets it, so a stale value never survives.
     CURRENT_TURN_TEXT.set(text)
+    LOCATION_TURN.set(set())
+    TRAVEL_ZONE.set({})
 
     specialists = dict(specialists or {})
     if action_graph is not None:
         specialists["action"] = action_graph
     action_graph = specialists.get("action")
+    from aerys_v2.dj import note_voice
+    note_voice(getattr(action_graph, "dj_store", None), identity)
 
     # Gate the action stack BEFORE anything else can arm it. A caller outside the
     # allowlist never reaches home_control / search_entities / get_state — closing
@@ -1230,6 +1456,12 @@ def ask(
         if action_graph is None:
             router = None
 
+    # The action allowlist can include guests; only the configured owner gets 60.
+    from aerys_v2 import factory
+
+    owner_turn = bool(factory._OWNER_ID) and identity.get("user_id") == factory._OWNER_ID
+    step_limit = rails.turn_limit if owner_turn else min(rails.turn_limit, 10)
+
     started = time.monotonic()
     # A mutable holder the graph writes into and the audit row reads back out.
     # `configurable` is the existing per-call channel and LangGraph copies it
@@ -1240,8 +1472,8 @@ def ask(
     room_sink: dict = {}
     config = {
         "configurable": {"thread_id": thread_id, "identity": identity,
-                         "room_sink": room_sink},
-        "recursion_limit": rails.turn_limit,
+                         "room_sink": room_sink, "outside_text": {}},
+        "recursion_limit": step_limit,
     }
 
     with _turn_span(str(thread_id), text, capture_payloads=trace_payloads):
@@ -1388,6 +1620,34 @@ def ask(
                 record_turn=record_turn, reflex=shadow, started=started,
                 human_privacy=origin_privacy, human_id=turn_msg_id,
                 tier=normalize_tier(decision.tier),
+                # D79 (Chris 11/20 21:09): an action-routed household DM gets the same honesty judge.
+                judged=_action_turn_judged(text_one_loop, decision.route, identity, action_allowlist,
+                                           factory._OWNER_ID),
+            )
+            _reclassify_if_needed(
+                graph, config, turn_msg_id, text, reply,
+                content_privacy_classifier, origin_privacy,
+            )
+            _face(face_push, "idle", reply)
+            registry[thread_id] = time.monotonic()
+            return _for_surface(reply, config)
+
+        # D79: one her, not twins. A chat-shaped turn from a household DM runs on the tool-armed graph
+        # as conversation. Checked AFTER the allowlist gate above, and the eligibility test checks the
+        # allowlist itself, so a guest can never reach the privileged graph this way.
+        one_loop_on = text_one_loop() if callable(text_one_loop) else bool(text_one_loop)
+        if (one_loop_on and action_graph is not None
+                and text_one_loop_eligible(identity, action_allowlist, factory._OWNER_ID)):
+            served = DEFAULT_TIER
+            asked_tier = normalize_tier(decision.tier)
+            log.info("route decision | thread=%s route=chat → one loop (asked tier=%s, served %s)",
+                     thread_id, asked_tier, served)
+            _face(face_push, "working")
+            reply = _text_one_loop_turn(
+                action_graph, graph, text, config, rails, started,
+                record_turn=record_turn, reflex=shadow,
+                human_privacy=origin_privacy, human_id=turn_msg_id,
+                tier=served, tier_override_source=ONE_LOOP_TIER_SOURCE if asked_tier != served else None,
             )
             _reclassify_if_needed(
                 graph, config, turn_msg_id, text, reply,
@@ -1423,7 +1683,18 @@ def ask(
             tier_override_source=override_source, extra_degraded=downgrade_marker,
             human_privacy=origin_privacy, human_id=turn_msg_id,
         )
-        claim_escalation = False
+        claim_escalation = promise_escalation = status_escalation = False
+        if not handoff and action_graph is not None and _promises_effect_without_doing_it(text, reply):
+            # D61 (Chris 11/18 10:16, "1. a"; ticket T-25): the same escalation for a PROMISE
+            # with nothing behind it. At 09:43 his "did you wanna do wordle while we wait" was
+            # routed here; she said "Sure, I'll play today's Wordle..." holding no tools, and
+            # nothing ran. The action graph either starts it or says honestly why it can't.
+            log.info(
+                "promise gate: tool-less chat reply promised an effectful act — "
+                "escalating to action | thread=%s", thread_id
+            )
+            handoff = True
+            promise_escalation = True
         if not handoff and action_graph is not None and _claims_effect_without_doing_it(
             text, reply
         ):
@@ -1444,6 +1715,16 @@ def ask(
             )
             handoff = True
             claim_escalation = True
+        if not handoff and action_graph is not None and claims_job_running(reply):
+            # D65 (Chris 11/18 11:38; the side agent's note): at 10:50 she said "The MapTap run is still
+            # going on my home machine" from the tool-less chat path when no job had ever started.
+            # Nothing here can look at her jobs, so the turn goes where she can, told to look first.
+            log.info(
+                "status gate: tool-less chat reply said a home job is running — "
+                "escalating to action | thread=%s", thread_id
+            )
+            handoff = True
+            status_escalation = True
         if handoff and action_graph is None:
             reply = HANDOFF_UNARMED_REPLY
             msg_id = _last_ai_message_id(graph, config["configurable"])
@@ -1471,8 +1752,11 @@ def ask(
                 human_privacy=origin_privacy, human_id=turn_msg_id,
                 replace_message_id=_last_ai_message_id(graph, config["configurable"]),
                 escalated=True,
-                extra_degraded=[CLAIM_GATE_MARKER] if claim_escalation else None,
+                extra_degraded=([CLAIM_GATE_MARKER] if claim_escalation else
+                                [PROMISE_GATE_MARKER] if promise_escalation else
+                                [STATUS_GATE_MARKER] if status_escalation else None),
                 tier=normalize_tier(decision.tier),
+                seed_hint=STATUS_CHECK_HINT if status_escalation else None,
             )
         _reclassify_if_needed(
             graph, config, turn_msg_id, text, reply,
@@ -1520,7 +1804,8 @@ def _chat_turn(
         with track_local_tool_fallback():
             result = graph.invoke(
                 {"messages": [_human_turn(text, human_privacy, human_id,
-                                           sealed_room=_sealed_room(config))]}, config
+                                           sealed_room=_sealed_room(config),
+                                           owner_assumed=_owner_assumed(config))]}, config
             )
     except Exception as e:
         # A raised invoke (model 500, recursion-rail trip) is the HIGHEST-value turn
@@ -1706,12 +1991,23 @@ def _chat_turn(
 
 ACTION_SEED_HUMAN_TURNS = 3      # prior requests kept for referent resolution
 ACTION_SEED_TRUNCATE_AT = 300    # chars per kept prior request
+#: A note from Kael (kael_line.NOTE_PREFIX) is information she needs whole, not a request to
+#: resolve "them" against: 11/09 an ~830-char ticket note was cut at 300 here and she told the
+#: owner it was cut off. Kept whole up to this; past it, it says so and where the rest is.
+KAEL_NOTE_KEEP = 4000
 
 
 def _trim_human_turn(m: HumanMessage) -> HumanMessage:
-    """A prior request, shortened for the specialist; tags and id preserved."""
+    """A prior request, shortened for the specialist; tags and id preserved. A note from Kael
+    is kept whole (up to KAEL_NOTE_KEEP, and then it says it was shortened)."""
+    from aerys_v2.kael_line import NOTE_PREFIX
+
     content = m.content
-    if isinstance(content, str) and len(content) > ACTION_SEED_TRUNCATE_AT:
+    if isinstance(content, str) and content.startswith(NOTE_PREFIX):
+        if len(content) > KAEL_NOTE_KEEP:
+            content = (content[:KAEL_NOTE_KEEP].rstrip() + " … [Kael's note was longer and is shortened "
+                       "here; the whole of it is on its ticket (kael_tickets) or with Kael.]")
+    elif isinstance(content, str) and len(content) > ACTION_SEED_TRUNCATE_AT:
         content = content[:ACTION_SEED_TRUNCATE_AT] + "…"
     return HumanMessage(
         content=content, id=getattr(m, "id", None),
@@ -1721,7 +2017,7 @@ def _trim_human_turn(m: HumanMessage) -> HumanMessage:
 
 def _action_history_seed(
     graph: object, configurable: dict, text: str, *, escalated: bool = False,
-    specialist: bool = False,
+    specialist: bool = False, voice: bool = False,
 ) -> list:
     """Seed the checkpointer-less action graph with the thread's PRIOR turns.
 
@@ -1754,14 +2050,34 @@ def _action_history_seed(
             exc_info=True,
         )
         prior = []
+    reading = ""
     if escalated and prior and getattr(prior[-1], "type", "") == "ai":
         # Escalated text turn: the chat invoke already checkpointed BOTH this
         # turn's human message and the marker handoff line. Drop the trailing
         # handoff line (the action model must reason from the request, not from
         # a note about handing off) — the human turn is then already the tail,
-        # so appending another copy would duplicate it.
+        # so appending another copy would duplicate it. Its words (marker off) are
+        # chat's reading of the request, made with the whole conversation in view:
+        # the full seed carries them (#182: "please if you dont mind" meant her offer).
+        if HANDOFF_MARKER in _reply_text(prior[-1]):
+            reading = _strip_handoff(_reply_text(prior[-1]))
         prior = prior[:-1]
+    # A relay may be the first item in his thread. window_messages removes leading
+    # assistant messages; retain this immediately replied-to outside quote so the
+    # action guard cannot lose its provenance on a fresh thread or window boundary.
+    reply_index = -2 if escalated and prior and isinstance(prior[-1], HumanMessage) else -1
+    relay_reply = prior[reply_index] if len(prior) >= abs(reply_index) else None
+    if not (isinstance(relay_reply, AIMessage)
+            and relay_reply.additional_kwargs.get("reach_source") == "relay"):
+        relay_reply = None
     prior = window_messages(prior, getattr(graph, "history_window_messages", 200))
+    if relay_reply is not None and relay_reply not in prior:
+        at = len(prior) - 1 if escalated and prior and isinstance(prior[-1], HumanMessage) else len(prior)
+        prior = [*prior[:at], relay_reply, *prior[at:]]
+    current_checkpointed = escalated and prior and getattr(prior[-1], "type", "") == "human"
+    if specialist and str(getattr(graph, "action_context", "requests") or "").strip().lower() == "full":
+        return _full_action_seed(graph, prior, text, identity, current_checkpointed=current_checkpointed,
+                                 reading=reading, voice=voice)
     # ── SPECIALIST SEED (2026-09-04): prior HUMAN turns only ──────────────────
     # The 7/05 continuity fix seeded the WHOLE prior exchange. Traced 9/04: her own
     # earlier line "I can't set a specific brightness" rode into the next command
@@ -1780,6 +2096,16 @@ def _action_history_seed(
         # DM/voice context passes the full history through; any other room drops
         # private-tagged priors and priors sealed to some other room.
         return gate_for_room(seeded, identity)
+    # Preserve just the immediately replied-to reach-out for feedback steering,
+    # even when the specialist otherwise folds only prior human requests.
+    before_current = prior[:-1] if current_checkpointed else prior
+    reach_reply = []
+    if before_current and isinstance(before_current[-1], AIMessage):
+        candidate = before_current[-1]
+        if candidate.additional_kwargs.get("reach_topic"):
+            visible = gate_for_room([candidate, HumanMessage(content=text)], identity)
+            if candidate in visible[:-1]:
+                reach_reply = [candidate]
     humans = [m for m in prior if getattr(m, "type", "") == "human"]
     if current_checkpointed:
         current = prior[-1]          # already checkpointed by the chat invoke
@@ -1797,7 +2123,7 @@ def _action_history_seed(
     # one. One message, the priors quoted as already-handled context, the
     # request last: nothing in the prompt looks like an unanswered instruction.
     if not priors:
-        return [current]
+        return [*reach_reply, current]
     note = "\n".join(f"- {_message_text(m)}" for m in priors)
     folded = (
         "Earlier requests in this conversation — ALREADY HANDLED, shown only so "
@@ -1805,10 +2131,58 @@ def _action_history_seed(
         "them out again unless the request below explicitly asks to repeat one:"
         f"\n{note}\n\nThe request to carry out now:\n{_message_text(current)}"
     )
-    return [HumanMessage(
+    return [*reach_reply, HumanMessage(
         content=folded, id=getattr(current, "id", None),
         additional_kwargs=dict(getattr(current, "additional_kwargs", {}) or {}),
     )]
+
+
+#: #182 (Chris 11/10): "i need actions to have context about a conversation its how you and i work. if her
+#: hands dont know the full conversation she will build garbage." With ACTION_CONTEXT=full the specialist
+#: sees the room-gated conversation, her replies included. September stays fixed where it lived: an earlier
+#: line of hers saying she can't do something ("I can't set a specific brightness" made her skip the tool on
+#: 9/04) carries this note right where it sits, and the charter says the tools decide.
+EARLIER_BELIEF_NOTE = ("[An earlier belief of yours, not a fact: your tools decide what you can do now. "
+                       "Try them before repeating it.]")
+_EARLIER_CANT = re.compile(
+    r"\bI(?:[\'’]m\s+(?:not\s+able|unable)|(?:\s+really)?\s+(?:can(?:not|[\'’]t|\s+not)|"
+    r"could(?:n[\'’]t|\s+not)|am\s+(?:not\s+able|unable)|(?:do\s+not|don[\'’]t)\s+have\s+"
+    r"(?:a\s+way|any\s+way|access|the\s+ability)|have\s+no\s+way))\b",
+    re.IGNORECASE,
+)
+
+
+def _mark_earlier_belief(m):
+    """Her earlier reply, with EARLIER_BELIEF_NOTE added when it claims she can't do something."""
+    text = _reply_text(m)
+    if not text or not _EARLIER_CANT.search(text):
+        return m
+    return AIMessage(content=f"{text}\n{EARLIER_BELIEF_NOTE}", id=getattr(m, "id", None),
+                     additional_kwargs=dict(getattr(m, "additional_kwargs", {}) or {}))
+
+
+def _full_action_seed(graph, prior: list, text: str, identity: dict, *, current_checkpointed: bool,
+                      reading: str, voice: bool) -> list:
+    """The specialist's view under ACTION_CONTEXT=full: the conversation's last messages (voice gets its
+    shorter window: it's metered and latency-bound), room-gated like chat, the request last."""
+    attr = "voice_action_context_messages" if voice else "action_context_messages"
+    window = int(getattr(graph, attr, 40) or 0)
+    if current_checkpointed:
+        current, before = prior[-1], list(prior[:-1])
+    else:
+        current, before = HumanMessage(content=text), list(prior)
+    before = [m for m in before if getattr(m, "type", "") in ("human", "ai")]
+    before = before[-window:] if window > 0 else []
+    if reading:
+        current = HumanMessage(
+            content=f"{_message_text(current)}\n\n[Reading the whole conversation, you took this as: {reading}]",
+            id=getattr(current, "id", None),
+            additional_kwargs=dict(getattr(current, "additional_kwargs", {}) or {}),
+        )
+    kept = gate_for_room([*before, current], identity)
+    if not kept:                     # the gate always keeps the request; if it ever didn't, the request alone
+        return [current]
+    return [_mark_earlier_belief(m) if getattr(m, "type", "") == "ai" else m for m in kept[:-1]] + [kept[-1]]
 
 
 def _message_text(m: HumanMessage) -> str:
@@ -1824,6 +2198,37 @@ def _message_text(m: HumanMessage) -> str:
         elif isinstance(part, dict):
             parts.append(f"[{part.get('type', 'attachment')}]")
     return " ".join(parts) or str(c)
+
+
+def _action_reply(content, config, messages=(), *, id=None):
+    """Keep outside provenance when the stateless action result lands in chat history.
+
+    Marked only when THIS turn read outside text (a reader receipt, or the per-turn holder,
+    which also covers failures after a reader). Never inherited from earlier marked replies in
+    the seed: each new reply would inherit, and one web read would hold her skill writes forever.
+    So the hold lasts while the reply that read the page is in her context (Kael, 11/14).
+    """
+    from aerys_v2.outside_guard import READERS
+
+    outside = (config.get('configurable') or {}).get('outside_text') or {}
+    marked = outside.get('outside_read') or any(
+        isinstance(m, ToolMessage) and m.name in READERS for m in messages
+    )
+    return AIMessage(content=content, id=id,
+                     additional_kwargs={'outside_read': True} if marked else {})
+
+
+def _with_seed_hint(seed: list, hint: str) -> list:
+    """D65: append a short instruction to his words in the action seed only (the seed is one-shot; the
+    main thread's history keeps his words as he wrote them)."""
+    if not seed or not isinstance(seed[-1], HumanMessage):
+        return seed
+    last = seed[-1]
+    if isinstance(last.content, str):
+        content = f"{last.content}\n\n{hint}"
+    else:
+        content = [*list(last.content or []), {"type": "text", "text": hint}]
+    return [*seed[:-1], last.model_copy(update={"content": content})]
 
 
 def _action_turn(
@@ -1842,6 +2247,8 @@ def _action_turn(
     extra_degraded: list[str] | None = None,
     tier: str = "standard",
     reflex: _ReflexShadow | None = None,
+    seed_hint: str | None = None,
+    judged: bool = False,
 ) -> str:
     """Run the tool subgraph, then land the outcome in the MAIN thread's history.
 
@@ -1875,11 +2282,24 @@ def _action_turn(
         )
         CURRENT_TURN_TEXT.set(_remember_window_for(seed, text, config))
         seed = _direct_device_seed(action_graph, seed)
+        if seed_hint:
+            seed = _with_seed_hint(seed, seed_hint)
+        if judged:
+            # D79 (Codex review of 45ea17c #1): the guard is told where his turn is, so a zero-tool bounce's
+            # human-shaped line never hides a relay before it, on this pass or the correction's.
+            config = {**config, "configurable": {**config["configurable"], "turn_human_index": _human_index(seed)}}
         result, gate_degraded = _run_action_gated(
             action_graph,
             seed,
             {**config, "configurable": {**config["configurable"], "specialist": True, "tier": tier}},
         )
+        if judged:
+            # D79: the honesty judge on this specialist turn's final reply (_judged_action_pass), after the
+            # zero-tool bounce above, which stays as it is.
+            result, judged_marks = _judged_action_pass(
+                action_graph, seed, result,
+                {**config, "configurable": {**config["configurable"], "specialist": True, "tier": tier}}, text)
+            gate_degraded = [*gate_degraded, *(m for m in judged_marks if m not in gate_degraded)]
     except Exception as e:
         # Rail trip / tool-loop blowup on the sequential action path: record the
         # failed turn (classifier_intent='action') before re-raising — or, on a
@@ -1908,17 +2328,14 @@ def _action_turn(
         _log_empty_reply(
             "action", config["configurable"].get("thread_id"), result_messages[-1],
         )
-    landed = (
-        AIMessage(content=final, id=replace_message_id)
-        if replace_message_id is not None
-        else AIMessage(content=final)
-    )
+    landed = _action_reply(final, config, result_messages, id=replace_message_id)
     messages: list = [landed]
     if add_human:
         # The tagged, stable-id human turn (so the async judge can retag it) — the
         # action graph never touched the main thread, so THIS is where it lands.
         messages.insert(0, _human_turn(text, human_privacy, human_id,
-                                        sealed_room=_sealed_room(config)))
+                                        sealed_room=_sealed_room(config),
+                                        owner_assumed=_owner_assumed(config)))
     graph.update_state(
         {"configurable": config["configurable"]}, {"messages": messages}, as_node="chat"
     )
@@ -1942,6 +2359,542 @@ def _action_turn(
         extra_degraded=degraded or None,
     )
     return final
+
+
+def _human_index(seed: list) -> int | None:
+    """Where his turn is in a seed (the last human message: a device seed or a hint may follow or edit it)."""
+    return next((i for i in range(len(seed) - 1, -1, -1) if isinstance(seed[i], HumanMessage)), None)
+
+
+def _carried_sources(messages: list) -> tuple:
+    """The outside readers that ran in MESSAGES (an earlier pass of this turn), for the guard on a rerun that
+    starts from his turn again (Codex review of 45ea17c #2). Names only, never what they read."""
+    from aerys_v2.outside_guard import READERS
+
+    return tuple(sorted({m.name for m in messages if isinstance(m, ToolMessage) and m.name in READERS}))
+
+
+def _invoke_collecting(action_graph: object, messages: list, config: dict, sink: list) -> dict:
+    """_invoke_action_graph, keeping what has run in SINK as it runs (the latest full message list), so a
+    model call that raises after a tool ran still leaves that tool's receipt for the reply and the row
+    (Codex review of 45ea17c #3). A graph that can't stream is invoked as before."""
+    stream = getattr(action_graph, "stream", None)
+    if stream is None or not callable(stream):
+        out = _invoke_action_graph(action_graph, messages, config)
+        sink[:] = list(out["messages"])
+        return out
+    config = {**config, "configurable": {**config.get("configurable", {}), "action_context_memo": {}}}
+    last = None
+    with track_local_tool_fallback():
+        for state in stream({"messages": messages}, config, stream_mode="values"):
+            if isinstance(state, dict) and isinstance(state.get("messages"), list):
+                last = state
+                sink[:] = list(state["messages"])
+    return last if last is not None else {"messages": list(messages)}
+
+
+def _run_gated_collecting(action_graph: object, seed: list, config: dict, sink: list) -> tuple[dict, list[str]]:
+    """_run_action_gated (the zero-tool bounce, unchanged) for a correction rerun, keeping what ran in SINK.
+    The legacy engine re-invokes outside the graph, so it is run as before (SINK gets its result)."""
+    if getattr(action_graph, "action_loop", None) != "agent":
+        result, marks = _run_action_gated(action_graph, seed, config)
+        sink[:] = list(result["messages"])
+        return result, marks
+    route = config.get("configurable", {}).get("specialist_route", "action")
+    config = {**config, "configurable": {**config.get("configurable", {}), "honesty_gate": True}}
+    result = _invoke_collecting(action_graph, seed, config, sink)
+    retried = any(isinstance(m, HumanMessage) and m.content == ACTION_NO_TOOL_CORRECTION
+                  for m in result["messages"])
+    verdict = action_honesty_gate(route, extract_tool_calls(result["messages"]), already_retried=retried,
+                                  specialists=(route,))
+    return result, [NO_TOOL_ACTION_MARKER] if verdict == GATE_MARK else []
+
+
+def _action_turn_judged(text_one_loop, route: str, identity: dict, action_allowlist, owner_id: str) -> bool:
+    """D79 on the ACTION path (Chris 11/20 21:09; a side agent found the gap): an action-routed turn is
+    judged when the one-loop switch is on and the caller is eligible for the one loop (household identity on
+    a DM surface). Voice, the lens, the guild and guests never are; switch off is exactly the old path."""
+    if route != "action":
+        return False
+    try:
+        on = text_one_loop() if callable(text_one_loop) else bool(text_one_loop)
+    except Exception:  # noqa: BLE001 -- a switch that can't be read is off
+        return False
+    return bool(on) and text_one_loop_eligible(identity, action_allowlist, owner_id)
+
+
+#: The correction pass on a judged action turn raised: the reply says what already went through.
+ACTION_CORRECTION_FAILED = "honesty_correction_failed"
+
+
+def _judged_action_pass(action_graph: object, seed: list, result: dict, run_config: dict,
+                        text: str) -> tuple[dict, list[str]]:
+    """The one loop's honesty judge, on an action-routed household DM's final reply: the same this_turn
+    (this run's receipts only), truth table, marks and correction rules (_text_one_loop_turn):
+    - any effectful tool called this turn (whatever came back), or a heard sound: one WORDS-ONLY pass
+      (action_graph.reply_only, the same specialist prompt with the correction and what was done in it);
+    - only reads (or nothing): his same specialist turn again, armed, with the correction in the system
+      prompt (never a HumanMessage), through the zero-tool gate as before;
+    - the corrected reply is judged again; still unbacked: the marker. Returns (result, marks); the result's
+      messages end in the reply that goes out."""
+    marks: list[str] = []
+    messages = list(result["messages"])
+
+    def this_run() -> list:
+        return messages[len(seed):]
+
+    try:
+        reply = _strip_handoff(_reply_text(messages[-1])) if messages else ""
+        receipts = _one_loop_receipts(this_run())
+        verdict = _one_loop_judged(action_graph, text, reply, receipts) if reply.strip() else None
+        _one_loop_mark(marks, verdict)
+        check = _one_loop_check(verdict, reply, receipts) if verdict is not None else None
+    except Exception:  # noqa: BLE001 -- the judge never blocks a reply
+        log.warning("action honesty judge: couldn't judge the reply; sent with the mark", exc_info=True)
+        return result, ["judge_unavailable"]
+    if check is None:
+        return result, marks
+    marker, correction, words_only = check
+    marks.append(ONE_LOOP_CORRECTED)
+    conf = run_config["configurable"]
+    try:
+        if words_only or _one_loop_acted(receipts):
+            log.info("action honesty judge: %s after an act — a words-only correction | thread=%s",
+                     marker, conf.get("thread_id"))
+            note = correction if words_only else ONE_LOOP_REPLY_ONLY_CORRECTION
+            messages.append(action_graph.reply_only(seed, {**run_config, "configurable": {
+                **conf, "one_loop_correction": note, "one_loop_done": _one_loop_done_note(receipts)}}))
+        else:
+            log.info("action honesty judge: %s with only reads — running his turn again | thread=%s",
+                     marker, conf.get("thread_id"))
+            sink: list = []
+            try:
+                again, again_marks = _run_gated_collecting(action_graph, seed, {**run_config, "configurable": {
+                    **conf, "one_loop_correction": correction, "turn_human_index": _human_index(seed),
+                    "carried_sources": _carried_sources(this_run())}}, sink)
+            except Exception:
+                messages.extend(sink[len(seed):])           # what the rerun did before it failed
+                raise
+            messages.extend(list(again["messages"])[len(seed):])
+            marks.extend(m for m in again_marks if m not in marks)
+            receipts = _one_loop_receipts(this_run())
+    except Exception as e:
+        receipts = _one_loop_receipts(this_run())
+        honest = _honest_reply_for_failure(e)
+        log.warning("action honesty judge: the correction failed (%s); saying what went through", e, exc_info=True)
+        marks.append(ACTION_CORRECTION_FAILED)
+        messages.append(AIMessage(content=_one_loop_with_evidence(honest or ONE_LOOP_FAILURE_LINE, receipts)))
+        return {**result, "messages": messages}, marks
+    reply = _strip_handoff(_reply_text(messages[-1]))
+    again_verdict = _one_loop_judged(action_graph, text, reply, receipts) if reply.strip() else None
+    _one_loop_mark(marks, again_verdict)
+    survived = _one_loop_check(again_verdict, reply, receipts) if again_verdict is not None else None
+    if survived is not None and survived[0] not in marks:
+        log.warning("action honesty judge: %s survived the correction — emitting with the marker", survived[0])
+        marks.append(survived[0])
+    return {**result, "messages": messages}, marks
+
+
+def _one_loop_call_kinds(name: str, args: dict) -> frozenset:
+    """What a call does: some of send / start / stop / record / device / read; 'other' for a tool the checks
+    don't know (it backs no claim, and counts as something that may have acted)."""
+    if name in ONE_LOOP_SEND:
+        return frozenset({"send"})
+    if name in ONE_LOOP_START:
+        return frozenset({"start"})
+    if name in ONE_LOOP_STOP:
+        return frozenset({"stop"})
+    if name in ONE_LOOP_READ_ONLY:
+        return frozenset({"read"})
+    if name in ONE_LOOP_RECORD:
+        return frozenset({"record"})
+    if name in ONE_LOOP_DEVICE:
+        return frozenset({"device"})
+    rule = ONE_LOOP_BY_OPERATION.get(name)
+    if rule is None:
+        return frozenset({"other"})
+    op = str((args or {}).get(rule["arg"]) or "").strip().lower()
+    if op in rule["reads"]:
+        return frozenset({"read"})
+    if op in rule.get("record", ()):
+        return frozenset({"record"})
+    return frozenset(rule["default"])
+
+
+def _one_loop_outcome(content: str, status: object = None) -> str:
+    """The execution-outcome contract (Codex re-check #2): completed, refused, pending or failed. Only a
+    completed call backs a claim. classify_tool_result measures infrastructure failure and counts a policy
+    refusal as success, so the refusals and waits are read here first, from the answer's first line."""
+    from aerys_v2.turns import classify_tool_result
+
+    first = next((line for line in str(content or "").splitlines() if line.strip()), "")
+    if classify_tool_result(str(content or ""), status) is not None:
+        return "failed"
+    if _ONE_LOOP_PENDING_RE.search(first):
+        return "pending"
+    if _ONE_LOOP_REFUSED_RE.search(first):
+        return "refused"
+    return "completed"
+
+
+def _one_loop_done_kinds(name: str, args: dict, content: str, status: object = None) -> frozenset:
+    """What this call COMPLETED (Codex second re-check #1, #2): the kinds its own words confirm, else nothing.
+    A read is completed when it answered (not failed, refused or waiting); an act only on its tool's words
+    for success (_ONE_LOOP_DONE_WORDS); an unknown tool never. Recording and delivery are separate kinds, so
+    a ticket kept but not yet delivered backs "noted", not "sent"."""
+    text = str(content or "")
+    if name == "no_action" or _one_loop_outcome(text, status) != "completed":
+        return frozenset()       # no_action answers in words only: it never backs a look or an act
+    kinds = _one_loop_call_kinds(name, args)
+    if kinds == {"read"}:
+        first = next((line for line in text.splitlines() if line.strip()), "")
+        return frozenset({"read"}) if first.strip() and not _ONE_LOOP_READ_REFUSED.search(first) else frozenset()
+    if name == "music":
+        return frozenset(kinds) if _ONE_LOOP_MUSIC_DONE.search(text) else frozenset()
+    done: set = set()
+    for pattern, completes in _ONE_LOOP_DONE_WORDS.get(name, ()):
+        if re.search(pattern, text.strip(), re.S):
+            done |= completes
+    return frozenset(done)
+
+
+def _one_loop_receipts(messages: list) -> list[dict]:
+    """Every executed call this turn: {name, kinds, outcome, ok (= completed), args, result}. Repair receipts
+    (a malformed call that never ran) are not calls."""
+    from aerys_v2.turns import invalid_call_ids, is_repair_receipt
+
+    requested: dict = {}
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if isinstance(tc, dict) and tc.get("id"):
+                requested[tc["id"]] = (tc.get("name"), tc.get("args") or {})
+    repairs = invalid_call_ids(messages)
+    out = []
+    for m in messages:
+        if getattr(m, "type", "") != "tool" or is_repair_receipt(m, repairs):
+            continue
+        asked_name, args = requested.get(getattr(m, "tool_call_id", None), (None, {}))
+        name = getattr(m, "name", None) or asked_name or "unknown"
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        status = getattr(m, "status", None)
+        outcome = _one_loop_outcome(content, status)
+        done = _one_loop_done_kinds(name, args, content, status)
+        if outcome == "completed" and not done:
+            outcome = "unconfirmed"          # no words of success from the tool: it backs nothing
+        out.append({"name": name, "kinds": _one_loop_call_kinds(name, args), "done": done, "outcome": outcome,
+                    "ok": bool(done), "args": args, "result": content})
+    return out
+
+
+def _one_loop_acted(receipts: list[dict]) -> bool:
+    """Was any effectful tool (a send, a start, a write, a house change; anything that isn't only a read)
+    CALLED this turn, whatever came back? Then a correction is words only, never his turn again with tools.
+    The middleware-ON replay (11/20): after a relay her send came back PENDING his tap, she said "sent", and
+    an armed correction called the send again and raised a SECOND approval button for the same message. A
+    refused, pending or failed act can be repeated, or land halfway ("Not drafted: … timed out; check Gmail
+    before trying again"), as surely as a completed one can run twice. Only reads leave the correction armed."""
+    return any(set(r["kinds"]) - {"read"} for r in receipts)
+
+
+#: Marks on a one-loop row from the honesty judge (honesty_judge.py): a correction pass ran; the judge was
+#: unsure (sent, counted, never bounced); the judge was unavailable (sent: an error, never a "no").
+ONE_LOOP_CORRECTED = "honesty_corrected"
+
+
+def _one_loop_judged(action_graph: object, asked: str, reply: str, receipts: list[dict]):
+    """The honesty judge's verdict on her reply (D79, Chris 11/20 18:51: the word lists go). No judge on the
+    graph, or any failure, is judge_unavailable: the reply is sent with the mark."""
+    from aerys_v2.honesty_judge import UNAVAILABLE, Verdict
+
+    judge = getattr(action_graph, "honesty_judge", None)
+    if judge is None:
+        return Verdict(UNAVAILABLE, reasons=["not armed"])
+    try:
+        return judge(asked, reply, receipts)
+    except Exception as exc:  # noqa: BLE001 -- the judge never blocks a reply
+        return Verdict(UNAVAILABLE, reasons=[type(exc).__name__])
+
+
+def _one_loop_check(verdict, reply: str, receipts: list[dict]) -> tuple[str, str, bool] | None:
+    """D79's postconditions on a one-loop reply: (marker, correction, words_only) when it needs a correction,
+    else None.
+    - The honesty judge says correct: she said she heard a sound (always words only: nothing can back it), or
+      said she did or checked something this turn's completed tool calls don't show, or promised to act now
+      with nothing acted, or said how a home job stands without a completed look at her jobs this turn (that
+      correction says to look first). The questions, criteria, thresholds and truth table live in
+      honesty_judge.py; the state it judges is code-written from the receipts, never raw tool output. No word
+      list reads her reply on this path (Codex final #1: D65's claims_job_running stays on the chat path only).
+    Which correction (words only, or his turn again with tools) is the caller's rule (_one_loop_acted)."""
+    from aerys_v2.honesty_judge import CORRECT
+
+    if verdict.outcome != CORRECT:
+        return None
+    if verdict.heard:
+        return AUDIO_CLAIM_MARKER, AUDIO_CLAIM_CORRECTION, True
+    if verdict.status_only:
+        return STATUS_GATE_MARKER, ONE_LOOP_STATUS_CORRECTION, False
+    return NO_TOOL_ACTION_MARKER, ONE_LOOP_CLAIM_CORRECTION, False
+
+
+#: The judge's request was cut to fit its caps (honesty_judge.build_state).
+ONE_LOOP_CLIPPED = "honesty_input_clipped"
+
+
+def _one_loop_mark(degraded: list, verdict) -> None:
+    """Every judge mark lands on the row, whatever else happens to the turn (Codex final #1): honesty_unsure,
+    judge_unavailable, and honesty_input_clipped; each once."""
+    from aerys_v2.honesty_judge import UNAVAILABLE, UNSURE
+
+    if verdict is None:
+        return
+    marks = ([verdict.outcome] if verdict.outcome in (UNSURE, UNAVAILABLE) else []) + (
+        [ONE_LOOP_CLIPPED] if getattr(verdict, "clipped", False) else [])
+    degraded.extend(m for m in marks if m not in degraded)
+
+
+def _one_loop_done_note(receipts: list[dict]) -> str:
+    """What already ran this turn, for a reply-only pass's system prompt (system only, never history)."""
+    lines = []
+    for r in receipts:
+        result = " ".join(str(r["result"]).split())
+        if len(result) > 300:
+            result = result[:300] + "…"
+        lines.append(f"- {r['name']} ({r['outcome']}): {result}")
+    return "\n".join(lines)
+
+
+def _one_loop_with_evidence(line: str, receipts: list[dict]) -> str:
+    """A failed turn's line, plus what already went through (Codex re-check #4: always, also after a
+    recognised failure like a rate limit), so he doesn't ask again and have it happen twice."""
+    ran = []
+    for r in receipts:
+        if set(r["done"]) - {"read"}:
+            words = ONE_LOOP_ACT_WORDS.get(r["name"], r["name"])
+            if words not in ran:
+                ran.append(words)
+    if not ran:
+        return line
+    return (f"{line} Before that, this went through: {', '.join(ran)}. "
+            "Check it before asking me again, so nothing happens twice.")
+
+
+def _text_one_loop_turn(
+    action_graph: object,
+    graph: object,
+    text: str,
+    config: dict,
+    rails: Rails,
+    started: float,
+    *,
+    record_turn: Callable[[dict], None] | None = None,
+    reflex: _ReflexShadow | None = None,
+    human_privacy: str = PRIVATE,
+    human_id: str | None = None,
+    tier: str = DEFAULT_TIER,
+    tier_override_source: str | None = None,
+) -> str:
+    """D79: a typed household-DM turn on the tool-armed action graph, as conversation.
+
+    The voice banter branch's shape (_voice_parallel_start, 2026-07-25), synchronous and typed: no ack, no
+    spoken follow-up, no handoff timer (Discord shows typing and splits long replies itself).
+    - specialist=False: her soul, not the charter, and no forced first tool; text_one_loop=True picks her
+      full long-term memory and the typed banter overlay in the prompt builder (factory).
+    - the seed is the room-gated thread with her own replies, inside the chat graph's 200-message window
+      (_action_history_seed, non-specialist), with her old voice tags taken off what she is shown.
+    - postconditions (_one_loop_check: the honesty judge, honesty_judge.py, plus D65's job-status gate), one
+      correction (Codex 11/20 #1, #2); the judge's unsure and unavailable verdicts send with a mark:
+        * the correction rides the system prompt for that pass (configurable one_loop_correction), never
+          the history: his turn stays the latest human turn, so a relay before it still taints, and a
+          reach-out still needs his tap;
+        * after any effectful tool was CALLED this turn, whatever its outcome (_one_loop_acted: a pending
+          send asked for twice raised two approval buttons), or for a claim to have heard a sound, the
+          correction is WORDS ONLY (action_graph.reply_only: no tools bound), so nothing can run twice;
+        * with only reads (or nothing) this turn, it may run again, armed, from his same turn;
+        * the judge looks again at the corrected reply; still unbacked: emitted with the marker. A correction
+          marks the row honesty_corrected.
+    - every exit, success or failure, lands one exchange (his words + what he reads) and fires one audit
+      row carrying every tool call that did run (Codex 11/20 #4).
+    The served tier is the conversational model's (standard): deep credits are never spent here, and a
+    different verdict from the router is kept on the row (tier_override_source)."""
+    from aerys_v2.factory import _untag_own_replies
+
+    configurable = config["configurable"]
+    LOCAL_FALLBACK_FIRED.set(False)
+    run_config = {**config, "configurable": {**configurable, "specialist": False, "tier": tier,
+                                               "text_one_loop": True}}
+    # "seed": how many of turn["messages"] are the seeded thread (earlier turns + his message). Receipts and
+    # the row read only what ran after it (the final replay: an earlier turn's look backed a status said now).
+    turn = {"messages": [], "seed": 0, "degraded": [ONE_LOOP_MARKER], "error": None}
+    done = {"finished": False}
+
+    def this_run() -> list:
+        return turn["messages"][turn["seed"]:]
+
+    def finish(reply_text: str, raw_text: str | None = None) -> str:
+        """The one exit: land the exchange, then record the row, whatever happened before."""
+        if done["finished"]:
+            return reply_text
+        done["finished"] = True
+        try:
+            graph.update_state(
+                {"configurable": configurable},
+                {"messages": [_human_turn(text, human_privacy, human_id,
+                                           sealed_room=_sealed_room(config),
+                                           owner_assumed=_owner_assumed(config)),
+                              _action_reply(reply_text, config, turn["messages"])]},
+                as_node="chat",
+            )
+        except Exception:
+            log.warning("one loop: couldn't write the exchange to the thread", exc_info=True)
+            turn["degraded"].append(ONE_LOOP_LAND_FAILED)
+        elapsed = time.monotonic() - started
+        if LOCAL_FALLBACK_FIRED.get():
+            turn["degraded"].append("local_model_fallback")
+        error = turn["error"]
+        if elapsed > rails.wall_clock_s:
+            # Late but real: the reply exists and is in history, so it is sent (the voice banter rule).
+            turn["degraded"].append("wall_clock_exceeded")
+            late = f"turn took {elapsed:.1f}s (budget {rails.wall_clock_s}s)"
+            error = f"{error}; {late}" if error else late
+        _fire_turn_record(
+            record_turn, config, text, int(elapsed * 1000),
+            reflex=reflex,
+            classifier_intent="chat",
+            tier=tier,
+            tier_override_source=tier_override_source,
+            raw_reply=reply_text if raw_text is None else raw_text,
+            emitted_reply=reply_text,
+            messages=this_run(),
+            extra_degraded=turn["degraded"],
+            error=error,
+        )
+        return reply_text
+
+    try:
+        seed = _untag_own_replies(_action_history_seed(graph, configurable, text))
+        turn["seed"] = len(seed)
+        # The guard is told where his turn is (Codex review of 45ea17c #1), on this pass and the rerun.
+        run_config = {**run_config, "configurable": {**run_config["configurable"],
+                                                     "turn_human_index": _human_index(seed)}}
+        CURRENT_TURN_TEXT.set(_remember_window_for(seed, text, config))
+        sink: list = []
+        try:
+            result = _invoke_collecting(action_graph, seed, run_config, sink)
+        except Exception:
+            turn["messages"] = list(sink)                   # what ran before it failed stays in evidence
+            raise
+        turn["messages"] = list(result["messages"])
+        reply = _strip_handoff(_reply_text(turn["messages"][-1]))
+        receipts = _one_loop_receipts(this_run())
+        verdict = _one_loop_judged(action_graph, text, reply, receipts) if reply.strip() else None
+        _one_loop_mark(turn["degraded"], verdict)
+        check = _one_loop_check(verdict, reply, receipts) if verdict is not None else None
+        if check is not None:
+            marker, correction, words_only = check
+            turn["degraded"].append(ONE_LOOP_CORRECTED)
+            if words_only or _one_loop_acted(receipts):
+                # Something already ran (or nothing could back it): words only, nothing runs twice.
+                log.info("one loop: %s after an act — a words-only correction | thread=%s",
+                         marker, configurable.get("thread_id"))
+                note = correction if words_only else ONE_LOOP_REPLY_ONLY_CORRECTION
+                again = action_graph.reply_only(seed, {**run_config, "configurable": {
+                    **run_config["configurable"], "one_loop_correction": note,
+                    "one_loop_done": _one_loop_done_note(receipts)}})
+                turn["messages"] = [*turn["messages"], again]
+            else:
+                # Nothing was done yet: run his same turn again, armed, with the correction in the system.
+                log.info("one loop: %s with nothing done — running his turn again | thread=%s",
+                         marker, configurable.get("thread_id"))
+                # From his turn again, with the first pass's outside reads carried for the guard (#2), and
+                # what it does kept as it goes (#3).
+                sink = []
+                try:
+                    result = _invoke_collecting(action_graph, seed, {**run_config, "configurable": {
+                        **run_config["configurable"], "one_loop_correction": correction,
+                        "carried_sources": _carried_sources(this_run())}}, sink)
+                except Exception:
+                    turn["messages"] = [*turn["messages"], *sink[len(seed):]]
+                    raise
+                turn["messages"] = [*turn["messages"], *list(result["messages"])[len(seed):]]
+                receipts = _one_loop_receipts(this_run())
+            reply = _strip_handoff(_reply_text(turn["messages"][-1]))
+            again_verdict = _one_loop_judged(action_graph, text, reply, receipts) if reply.strip() else None
+            _one_loop_mark(turn["degraded"], again_verdict)
+            survived = _one_loop_check(again_verdict, reply, receipts) if again_verdict is not None else None
+            if survived is not None:
+                log.warning("one loop: %s survived the correction — emitting with the marker", survived[0])
+                turn["degraded"].append(survived[0])
+    except Exception as e:
+        honest = _honest_reply_for_failure(e)
+        turn["degraded"].append("recursion_limit" if type(e).__name__ == "GraphRecursionError" else "turn_failed")
+        turn["error"] = str(e) or type(e).__name__
+        log.warning("one loop: the turn failed (%s); landing an honest line", turn["error"], exc_info=True)
+        return finish(_one_loop_with_evidence(honest or ONE_LOOP_FAILURE_LINE,
+                                              _one_loop_receipts(this_run())))
+
+    raw = reply
+    if not raw.strip():
+        turn["degraded"].append(EMPTY_REPLY_MARKER)
+        reply = BLANK_REPLY_LINE
+        _log_empty_reply("one_loop", configurable.get("thread_id"), turn["messages"][-1])
+    return finish(reply, raw)
+
+
+_TITLE_ABBREVIATIONS = frozenset({"mr.", "mrs.", "ms.", "dr.", "st.", "jr.", "sr.", "vol.", "no.",
+                                  "feat.", "ft.", "vs.", "pt.", "op."})
+
+
+#: what an offer or a question sounds like once the music has started (D52: no offers, no questions)
+_MUSIC_OFFER = re.compile(r"\b(want me|would you like|do you want|if you'?d like|if you like|i can|"
+                          r"let me know|should i|tell me|just say|say the word)\b", re.IGNORECASE)
+#: the plain line for a music write whose own words broke that rule, from the tool's Done note
+_MUSIC_DONE = (
+    (re.compile(r"^Done: playing (.+?) on [^.]+\."), "Playing {}."),
+    (re.compile(r"^Done: queued next (.+?) on [^.]+\."), "{} is up next."),
+    (re.compile(r"^Done: queued (.+?) on [^.]+\."), "Added {} to the queue."),
+    (re.compile(r"^Done: similar-track radio started"), "More like this, coming up."),
+)
+
+
+def _quiet_music_reply(text: str, result_messages: list) -> str:
+    """Voice-only caller: music writes get one sentence, at most 12 words, and no offer or question
+    (D52, 11/14: "a dissertation about music and playlists for the first 45 seconds")."""
+    from aerys_v2.tools.home_control import WRITE_OK_PREFIX
+
+    notes = [m for m in result_messages if isinstance(m, ToolMessage)]
+    if not notes or not all(m.name == "music" and isinstance(m.content, str)
+                            and m.content.startswith(WRITE_OK_PREFIX) for m in notes):
+        return text
+    # Song titles carry dots ("Mr. Blue Sky", "P.S. I Love You", "Vol. 2"): a sentence ends at a word
+    # closing in . ! ? … that isn't an abbreviation or initials, at a ; or — clause, or at a line break.
+    words: list[str] = []
+    for line in text.strip().splitlines() or [""]:
+        words = line.split()
+        if words:
+            break
+    for i, word in enumerate(words):
+        bare = word.rstrip("\"'”’)")
+        if bare in ("—", "–") or bare[-1:] in (";", "—"):
+            words = words[:i] if bare in ("—", "–") else words[:i] + [bare.rstrip(";—") + "."]
+            break
+        if bare[-1:] in (".", "!", "?", "…") and not (bare[-1] == "." and not bare.endswith("...") and (
+                bare.lower() in _TITLE_ABBREVIATIONS or re.fullmatch(r"(?:\w\.)+", bare))):
+            words = words[:i + 1]
+            break
+    sentence = " ".join(words)
+    # judge the whole sentence before shortening it: a cut must never hide a question or an offer
+    if not sentence or "?" in sentence or _MUSIC_OFFER.search(sentence):
+        note = str(notes[-1].content)
+        sentence = next((said.format(*hit.groups()) for pattern, said in _MUSIC_DONE
+                         if (hit := pattern.match(note))), "Done.")
+    return _at_most_twelve_words(sentence)
+
+
+def _at_most_twelve_words(sentence: str) -> str:
+    words = sentence.split()
+    if len(words) <= 12:
+        return sentence
+    return " ".join(words[:11] + [words[11].rstrip(",;:—-") + "."])
 
 
 def _needs_spoken_followup(
@@ -2061,11 +3014,29 @@ _NEGATION_RE = re.compile(
 _NEGATION_WINDOW = 45
 
 
+#: D79 (11/20 10:55, turn 3476): "I’ve started a home job to update the MapTap skill" claimed a job she never
+#: started and slipped past both "I've" (a curly apostrophe) and the verb list. A start reported in her own
+#: voice, with something started as its object.
+_STARTED_CLAIM_RE = re.compile(
+    r"\b(?:i|i've|i have)\s+(?:just\s+|already\s+|now\s+)?(?:started|kicked off|launched|fired off|fired up|"
+    r"set off|queued up|begun)\s+"
+    # What was started is a job, not a book (Codex re-check 11/20: "I started a new book" is talk): the
+    # pronoun of something just asked for, or a job-shaped noun within a few words.
+    r"(?:(?:it|them)\b|(?:that|this)(?=\s*(?:[.,;:!?\u2014-]|$|now\b|for you\b|already\b|on my\b))"
+    r"|(?:(?:a|an|the|your|my|today's|that|this|on|up)\s+)?(?:\w+\s+){0,3}?"
+    # an execution job, never a job at work (Codex second re-check 11/20)
+    r"(?:home\s+job|job\s+on\s+my\s+home|(?:async|background)\s+job|task|run|update|edit|wordle|maptap|"
+    r"timer|download|scan|backup)s?\b)",
+    re.I,
+)
+
+
 def claims_effect_done(text: str) -> bool:
     """Does this reply claim, in its own voice, that an effectful act happened?"""
+    text = _plain_quotes(text)
     if not text:
         return False
-    for pattern in _CLAIM_PATTERNS:
+    for pattern in (*_CLAIM_PATTERNS, _STARTED_CLAIM_RE):
         for m in pattern.finditer(text):
             window = text[max(0, m.start() - _NEGATION_WINDOW): m.start()]
             if not _NEGATION_RE.search(window):
@@ -2074,6 +3045,153 @@ def claims_effect_done(text: str) -> bool:
 
 
 VOICE_EMPTY_REPLY = "Hm — I lost that thought. Ask me again?"
+#: Board #214 (11/15): HA's voice integration waits 15 s for her reply. A banter turn still working at
+#: VOICE_HANDOFF_S says one of these now and its answer follows as a spoken follow-up. A few lines, so
+#: it doesn't sound like the same cue every time (his ear for repeated cues, 11/14).
+VOICE_HANDOFF_S = 9.0
+VOICE_HANDOFF_LINES = ("One sec, let me look.", "Give me a moment, I'm checking.", "Hang on, I'm looking that up.",
+                       "Let me check on that.", "Just a second, I'm on it.")
+VOICE_HANDOFF_MARKER = "voice_handoff"
+
+# D61 (Chris 11/18): what a promise to act NOW looks like, in her own voice. Effect verbs only: a
+# promise to tell a story or to remember a feeling is talk, not a job.
+_PROMISE_VERBS = (
+    r"(?:play(?!\s+(?:devil'?s advocate|along|nice|it (?:cool|safe|by ear)|dumb|hard to get|favou?rites|the long game))|start(?!\s+(?:with|by|off with|over|from|the story|a story|the tale|our story|the game|a game|a round))|"
+    r"run|kick (?:it |that |this )?off|launch|"
+    r"send|message|email|text|book|order|schedule|set (?:up|it|that|a|an|the|your)|search|"
+    r"look (?:it |that |this )?up|look into|"
+    r"check (?:on |in on )?(?:it|that|them|this|the|your|my|his|her|their)|read (?:it|that|your|my|the)|"
+    r"open (?:it|that|your|the)|turn|switch|post|share|"
+    r"let (?:kael|kayle|cale|kale|him|her|them) know|pass (?:it |that )?(?:along|on)|"
+    r"do (?:it|that|this|today's|the|one))"
+)
+#: Codex 11/18: a promise for LATER or ON A CONDITION is not "now" ("I'll play it tomorrow",
+#: "I'll send it once you approve"); checked in the rest of the promise's own sentence.
+_DEFERRED_RE = re.compile(
+    r"\b(?:tomorrow|later|tonight|next (?:week|time|month|round)|sometime|soon|whenever|"
+    r"once (?:you|it|he|that|we)|when (?:you|it|he|that|we)|after (?:you|it|he|that|we|work)|"
+    r"if (?:you|it|he|that|we)|in the morning|this (?:evening|afternoon|weekend))\b", re.I)
+_SENTENCE_END = re.compile(r"[.!?\n]")
+#: A condition stated before the promise ("Once you approve, I'll send it") defers it too.
+_CONDITION_BEFORE_RE = re.compile(r"\b(?:once|when|after|if|whenever|as soon as)\b[^.!?\n]*,\s*$", re.I)
+#: An explicit "now" wins over a date that is the task's own argument ("set the reminder for
+#: tomorrow now"): the act is now, its subject is tomorrow.
+_NOW_RE = re.compile(r"\b(?:now|right now|right away|immediately)\b", re.I)
+_PROMISE_PATTERNS = (
+    # "I'll play today's Wordle", "let me kick that off", "I'm going to send it now"
+    re.compile(
+        rf"\b(?:i'll|i will|i'm going to|i am going to|i'm gonna|let me|i'm about to)\s+"
+        rf"(?:go ahead and\s+|just\s+|now\s+|quickly\s+)?{_PROMISE_VERBS}\b",
+        re.I,
+    ),
+    # terse: "On it.", "Starting it now.", "Kicking that off."
+    re.compile(r"(?:^|[.!?]\s+|[—-]\s*)(?:on it|starting (?:it|that|now|the)|kicking (?:it|that) off)\b", re.I),
+    # 11/18 10:47: an act in progress, said at the head of a sentence ("Starting today's MapTap run on my
+    # home machine now", "Sure thing, launching MapTap", "I'm now sending it to Kael"). A story's opening,
+    # a heading ("Running total:") and an idiom ("Sending good vibes") are talk.
+    re.compile(
+        r"(?:^|[.!?]\s+|[—-]\s*)"
+        r"(?:(?:okay|ok|alright|sure thing|sure|great|got it|good|absolutely|on it)[,!.]?\s+)?"
+        r"(?:(?:chris|sir)[,!.]?\s+)?(?:i'm\s+|i am\s+)?(?:(?:now|just|going ahead and)\s+)*"
+        r"(?:starting|kicking off|launching|firing up|opening|sending|playing|running|checking|turning|"
+        r"switching|setting up|looking up|searching|messaging|texting|emailing|booking|ordering|posting|sharing)\b"
+        r"(?!:)(?!\s+(?:with|by|off with|over|from|the story|a story|the tale|our story|a new chapter|"
+        r"good vibes|devil'?s advocate|gears|low|late|out|short|behind|total|thoughts?|a thought|my understanding|"
+        r"to (?:your|that|this|the|my) (?:question|point|topic|idea))\b)",
+        re.I,
+    ),
+)
+#: His message proposes an activity even when it isn't phrased as an order ("did you wanna...").
+#: D79 (11/20 10:55): or gives his permission ("you are good to update your skill", "feel free to", "you have
+#: my go"), which the router read as talk.
+_PROPOSES_RE = re.compile(
+    r"\b(?:wanna|want to|could you|can you|would you|will you|go ahead|let'?s|"
+    r"mind (?:doing|playing|checking|starting)|"
+    # A permission with an act after it: "you're good to update it". Not "you're good to go" on its own, not
+    # "you're welcome to your opinion" (Codex re-check 11/20: both escalated ordinary talk).
+    r"(?:you(?:'re| are) (?:good|free|clear|cleared|okay|ok|fine) to|feel free to)\s+(?:go ahead|update|start|"
+    r"run|send|play|kick|launch|do|edit|fix|change|book|order|post|share|message|email|text|turn|switch|set|"
+    r"check|look|search|schedule|add|remove|save|write|try|make|open|pass|tell|let)\b|"
+    r"you (?:can|may) (?:go ahead|proceed|start|do it)|"
+    r"you have my (?:go|ok|okay|blessing|permission|approval)|permission granted)\b", re.I)
+#: 11/18 10:47: or his whole message is a yes to what she offered ("give it a shot", "go for it",
+#: "sure, do it"). The whole message, so "yeah, like this going forward" stays talk.
+_CONSENT_RE = re.compile(
+    r"\s*(?:(?:ok(?:ay)?|sure|yes|yeah|yep|yup|alright|cool|great|perfect|absolutely|definitely)[\s,!.]*)*"
+    r"(?:give it a (?:shot|go|try|whirl)|go for it|(?:go ahead and )?(?:do|try|start|play|run|send) it|"
+    r"go ahead|let'?s (?:do it|go|try it)|sounds good|please do|sure thing|of course|absolutely|definitely|"
+    r"yes|yeah|yep|yup|sure|ok(?:ay)?|\U0001f44d)"
+    r"(?:[\s,!.]*(?:please|then|now|sir))?[\s!.]*", re.I)
+
+
+def _plain_quotes(text: str) -> str:
+    """Curly apostrophes as straight ones (Codex 11/18: "I’ll play" slipped past)."""
+    return (text or "").replace("\u2019", "'").replace("\u2018", "'")
+
+
+def promises_effect_now(text: str) -> bool:
+    """Does this reply promise, in its own voice, to do an effectful act now?"""
+    text = _plain_quotes(text)
+    if not text:
+        return False
+    for pattern in _PROMISE_PATTERNS:
+        for m in pattern.finditer(text):
+            window = text[max(0, m.start() - _NEGATION_WINDOW): m.start()]
+            end = _SENTENCE_END.search(text, m.end())
+            rest = text[m.end(): end.start() if end else len(text)]
+            starts = [x.end() for x in _SENTENCE_END.finditer(text, 0, m.start())]
+            before = text[starts[-1] if starts else 0: m.start()]
+            deferred = (_DEFERRED_RE.search(rest) or _CONDITION_BEFORE_RE.search(before)) and not _NOW_RE.search(rest)
+            if not _NEGATION_RE.search(window) and not deferred:
+                return True
+    return False
+
+
+def _promises_effect_without_doing_it(user_text: str, reply: str) -> bool:
+    """D61: a TOOL-LESS chat reply promised an act, and he had asked or proposed one. Both are
+    needed, as for the claim gate: "I'll play it later?" from reminiscing never fires."""
+    user_text = _plain_quotes(user_text)
+    return bool(promises_effect_now(reply) and (
+        plausibly_asks_for_action(user_text) or _PROPOSES_RE.search(user_text)
+        or _CONSENT_RE.fullmatch(user_text)))
+
+
+#: D65: her reply says a home job is running or underway, as a plain statement. Judged one SENTENCE at a
+#: time (Codex 11/18: punctuation between "the job" and "still running" is still one claim; "No worries."
+#: before it is not a negation): the sentence needs a status phrase AND a job cue; nothing before the
+#: phrase may negate it, make it a condition or a reported question ("If the job is running", "I cannot
+#: confirm whether ..."), except that a "but" starts a fresh clause ("I can't see the page, but the run is
+#: still going" is a claim). A question counts only when the status sits in the question's own clause.
+#: "your job" / "his job" / "your new job" is his work, not hers.
+_JOB_STATUS_RE = re.compile(
+    r"\b(?:(?:is|'s|are)\s+(?:still\s+)?(?:going|running|in progress|underway|chugging along|working|playing)"
+    r"|still\s+(?:going|running|in progress|underway|chugging along|working|playing))\b"
+    r"(?!\s+(?:low|late|out|short|behind|well|to)\b)", re.I)
+_JOB_CUE_RE = re.compile(
+    r"(?<!your )(?<!his )(?<!their )(?<!her )(?<!new )\b(?:run|job|task|session|maptap|wordle|browser|"
+    r"home (?:machine|body|computer))\b", re.I)
+_NOT_A_CLAIM_RE = re.compile(
+    r"\b(?:if|whether|when|once|until|unless|in case|asked|ask|wondering|wonder|checking if|see if)\b", re.I)
+_STATUS_NEGATION_RE = re.compile(r"\b(?:isn'?t|aren'?t|wasn'?t|weren'?t|no longer)\b", re.I)
+_CLAUSE_END = re.compile(r"[,;:\u2014]")
+
+
+def claims_job_running(text: str) -> bool:
+    """D65: does this reply say, in its own voice, that a home job is running right now?"""
+    text = _plain_quotes(text)
+    for sentence in re.split(r"(?<=[.!?\n])\s+", text or ""):
+        m = _JOB_STATUS_RE.search(sentence)
+        if not m or not _JOB_CUE_RE.search(sentence):
+            continue
+        if sentence.rstrip().endswith("?") and not _CLAUSE_END.search(sentence[m.end():]):
+            continue                       # the status is in the question itself: she's asking
+        before = re.split(r"\bbut\b", sentence[: m.start()], flags=re.I)[-1]
+        if (_NEGATION_RE.search(before) or _STATUS_NEGATION_RE.search(before)
+                or _NEGATION_RE.search(m.group(0)) or _NOT_A_CLAIM_RE.search(before)):
+            continue
+        return True
+    return False
+
 
 def _claims_effect_without_doing_it(user_text: str, reply: str) -> bool:
     """Did a TOOL-LESS chat reply claim it performed an effectful act?
@@ -2089,10 +3207,15 @@ def _claims_effect_without_doing_it(user_text: str, reply: str) -> bool:
     router's own action heuristics), so reminiscing ("remember when you turned
     the lights off?") or hypotheticals never trip it — only a real request that
     the router sent to chat, answered as though it had been carried out.
+
+    D79 (11/20 10:55): a proposal or a yes counts as asking, the same as for the
+    promise gate (his "you are good to update your skill" was neither an order
+    nor a question).
     """
-    return bool(
-        plausibly_asks_for_action(user_text) and claims_effect_done(reply)
-    )
+    user_text = _plain_quotes(user_text)
+    asked = (plausibly_asks_for_action(user_text) or _PROPOSES_RE.search(user_text)
+             or _CONSENT_RE.fullmatch(user_text))
+    return bool(asked and claims_effect_done(reply))
 
 
 def _voice_parallel_start(
@@ -2185,12 +3308,13 @@ def _voice_parallel_start(
         # a late AI result can still land after a newer turn's pair — the full
         # placeholder-replace fix is deliberately out of tonight's scope.)
         seeded_messages = _action_history_seed(
-            graph, real_configurable, text, specialist=True
+            graph, real_configurable, text, specialist=True, voice=True
         )
         graph.update_state(
             {"configurable": real_configurable},
             {"messages": [_human_turn(text, human_privacy, human_id,
-                                       sealed_room=_sealed_room({"configurable": real_configurable}))]},
+                                       sealed_room=_sealed_room({"configurable": real_configurable}),
+                                       owner_assumed=_owner_assumed({"configurable": real_configurable}))]},
             as_node="chat",
         )
 
@@ -2226,6 +3350,9 @@ def _voice_parallel_start(
                     result_messages[-1] if result_messages else None,
                 )
 
+            if not failed and not blank:
+                final = _quiet_music_reply(final, result_messages)
+
             # Spoken follow-up: failures ALWAYS speak; with confirm_writes
             # (owner ruling 2026-10-01) every outcome speaks; otherwise the
             # silent-success rule decides (fast clean write = say nothing).
@@ -2245,7 +3372,7 @@ def _voice_parallel_start(
             # human turn already landed at ack time; only the outcome appends.
             graph.update_state(
                 {"configurable": real_configurable},
-                {"messages": [AIMessage(content=final)]},
+                {"messages": [_action_reply(final, action_config, result_messages)]},
                 as_node="chat",
             )
             _reclassify_if_needed(
@@ -2345,9 +3472,12 @@ def _voice_parallel_start(
         real_configurable.get("thread_id"),
     )
     _face(face_push, "working")
-    gate_degraded: list[str] = []
     LOCAL_FALLBACK_FIRED.set(False)
-    try:
+
+    def _banter_work() -> tuple[list, str, list[str], bool]:
+        """The banter turn itself: (messages, reply, gate markers, local fallback fired)."""
+        LOCAL_FALLBACK_FIRED.set(False)
+        work_degraded: list[str] = []
         # NO spoken_ack in config: that's the signal (factory.act) to style the
         # reply for voice banter instead of arming the ack-consistency overlay.
         result = _invoke_action_graph(
@@ -2372,7 +3502,95 @@ def _voice_parallel_start(
                     "voice banter effectful-claim gate: STILL claiming with zero "
                     "tools — emitting with the %s marker", NO_TOOL_ACTION_MARKER,
                 )
-                gate_degraded = [NO_TOOL_ACTION_MARKER]
+                work_degraded = [NO_TOOL_ACTION_MARKER]
+        return result_messages, reply, work_degraded, bool(LOCAL_FALLBACK_FIRED.get())
+
+    # 11/15 (board #214): HA's voice integration waits 15 s. A banter turn that runs tools can take
+    # longer ("Aerys is unreachable" while her answer still reached the panel). Past VOICE_HANDOFF_S
+    # she says a short line now and the answer follows as a spoken follow-up, the way action turns
+    # already work. The lock decides who owns the result: the caller (in time) or the worker (late).
+    box: dict = {}
+    lock = threading.Lock()
+
+    def _banter_worker() -> None:
+        try:
+            out = _banter_work()
+        except Exception as e:  # noqa: BLE001 - surfaced to whichever side owns the result
+            out = e
+        # The fallback flag lives in THIS thread's copied context: carry it out either way.
+        fallback = bool(LOCAL_FALLBACK_FIRED.get())
+        with lock:
+            box["out"], box["fallback"] = out, fallback
+            late = box.get("handed_off", False)
+        if late:
+            _finish_handed_off(out, fallback)
+
+    def _finish_handed_off(out, fallback: bool) -> None:
+        failed = isinstance(out, Exception)
+        if failed:
+            log.warning("voice banter turn failed after the handoff", exc_info=out)
+            final = _honest_reply_for_failure(out) or "Sorry, I couldn't finish looking that up."
+            result_messages, work_degraded = [], ["action_failed"]
+        else:
+            result_messages, final, work_degraded, _ = out
+            final = _quiet_music_reply(final, result_messages)
+        _deliver_followup(final, device_id, followup_router, speak_fn, satellite_for)
+        _face(face_push, "speaking", final)
+        graph.update_state(
+            {"configurable": real_configurable},
+            {"messages": [_action_reply(final, config, result_messages)]},
+            as_node="chat",
+        )
+        _reclassify_if_needed(
+            graph, config, human_id, text, final,
+            content_privacy_classifier, human_privacy,
+        )
+        _fire_turn_record(
+            record_turn, config, text, int((time.monotonic() - started) * 1000),
+            reflex=reflex,
+            classifier_intent="chat",
+            tier=DEFAULT_TIER,
+            raw_reply=final,
+            emitted_reply=interim,
+            messages=result_messages,
+            extra_degraded=[*work_degraded, *(["local_model_fallback"] if fallback else []),
+                            *(["wall_clock_exceeded"] if time.monotonic() - started > rails.wall_clock_s else []),
+                            VOICE_HANDOFF_MARKER],
+        )
+
+    device_id = real_configurable.get("identity", {}).get("device_id")
+    interim = random.choice(VOICE_HANDOFF_LINES)
+    threading.Thread(target=_in_ctx(_banter_worker), daemon=True, name="voice-banter").start()
+    deadline = time.monotonic() + VOICE_HANDOFF_S
+    while True:
+        with lock:
+            if "out" in box:
+                out = box["out"]
+                break
+            if time.monotonic() >= deadline:
+                box["handed_off"] = True
+                out = None
+                break
+        time.sleep(0.05)
+    if out is None:
+        log.info("voice banter turn passed %.0fs: a short line now, the answer as a follow-up", VOICE_HANDOFF_S)
+        # His words land now (so a newer turn can't come before them); her answer appends when it lands.
+        graph.update_state(
+            {"configurable": real_configurable},
+            {"messages": [_human_turn(text, human_privacy, human_id,
+                                       sealed_room=_sealed_room({"configurable": real_configurable}),
+                                       owner_assumed=_owner_assumed({"configurable": real_configurable}))]},
+            as_node="chat",
+        )
+        _face(face_push, "speaking", interim)
+        return interim
+
+    gate_degraded: list[str] = []
+    LOCAL_FALLBACK_FIRED.set(bool(box.get("fallback")))     # the worker's flag, success or failure
+    try:
+        if isinstance(out, Exception):
+            raise out
+        result_messages, reply, gate_degraded, _ = out
     except Exception as e:
         # A rate/session-limit cap gets the honest in-voice line (the 2026-07-12
         # empty-glasses fix); anything else records the failure and re-raises.
@@ -2392,12 +3610,15 @@ def _voice_parallel_start(
         graph.update_state(
             {"configurable": real_configurable},
             {"messages": [_human_turn(text, human_privacy, human_id,
-                                       sealed_room=_sealed_room({"configurable": real_configurable})),
-                          AIMessage(content=honest)]},
+                                       sealed_room=_sealed_room({"configurable": real_configurable}),
+                                       owner_assumed=_owner_assumed({"configurable": real_configurable})),
+                          _action_reply(honest, config)]},
             as_node="chat",
         )
         _face(face_push, "speaking", honest)
         return honest
+
+    reply = _quiet_music_reply(reply, result_messages)
 
     # The action graph has no checkpointer — the turn lands on the REAL thread
     # here, exactly one human + one assistant message (cross-review history
@@ -2405,8 +3626,9 @@ def _voice_parallel_start(
     graph.update_state(
         {"configurable": real_configurable},
         {"messages": [_human_turn(text, human_privacy, human_id,
-                                   sealed_room=_sealed_room({"configurable": real_configurable})),
-                      AIMessage(content=reply)]},
+                                   sealed_room=_sealed_room({"configurable": real_configurable}),
+                                   owner_assumed=_owner_assumed({"configurable": real_configurable})),
+                      _action_reply(reply, config, result_messages)]},
         as_node="chat",
     )
 

@@ -11,6 +11,7 @@ import logging
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -25,13 +26,15 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from aerys_v2.action_context import memoized
 from aerys_v2.anthropic_model import build_metered_model
 from aerys_v2.config import Settings
+from aerys_v2.house_names import NAMES, wife_or
 from aerys_v2.history import prompt_with_context, window_messages
 from aerys_v2.router import DEFAULT_TIER, HANDOFF_MARKER, normalize_tier
 from aerys_v2.state import ChatState, identity_from_config, is_lens_surface, is_voice_turn
 from aerys_v2.turns import channel_enum
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +43,12 @@ log = logging.getLogger(__name__)
 #: run on worker threads that need not inherit the builder's context, and a fence that
 #: silently reads None on some threads is a fence that does not hold.
 _OWNER_ID: str | None = None
+
+#: What a satellite says when we open its mic ourselves (the office button, keep-listening reopens).
+#: HA's start_conversation needs a message; an empty one opens the mic in silence, and the office
+#: panel chime (it fires on "listening") is the cue. The owner, 11/14 19:37: "lets just do the chime.
+#: the Mm? is cute but i have a bit of uncanny valley right now" ("Mm?" may come back later).
+OPEN_MIC_MESSAGE = ""
 
 
 def set_owner_id(owner_person_id: str | None) -> None:
@@ -260,7 +269,7 @@ def context_fn_for(settings: Settings, *, profile_only: bool = False) -> Context
 
     def people(person_id: str, window_text: str, privacy_context: str = "public") -> str:
         # What she remembers about the people the conversation is ABOUT (owner 2026-10-22:
-        # on voice she "suddenly doesnt remember Joe"). Same fences as context_fn.
+        # on voice she "suddenly doesnt remember [a friend]"). Same fences as context_fn.
         from aerys_v2.services.people_memory import people_memory_block
         try:
             with psycopg.connect(settings.memories_database_url) as conn:
@@ -270,6 +279,35 @@ def context_fn_for(settings: Settings, *, profile_only: bool = False) -> Context
             log.warning("people-memory context failed for person %s", person_id, exc_info=True)
             return ""
 
+    def people_with_memo(memo):
+        from aerys_v2.services.people_memory import PEOPLE_SQL, assemble_people_block, person_section
+
+        def read(person_id, window_text, privacy_context):
+            # Open at most one connection on a pass with misses, none on all hits.
+            with ExitStack() as stack:
+                conn = None
+
+                def connection():
+                    nonlocal conn
+                    if conn is None:
+                        conn = stack.enter_context(psycopg.connect(settings.memories_database_url))
+                        conn.read_only = True
+                    return conn
+
+                def roster():
+                    return connection().execute(PEOPLE_SQL).fetchall()
+
+                def section(speaker, name, privacy):
+                    return person_section(connection(), speaker, name, privacy)
+
+                return assemble_people_block(
+                    person_id, window_text, privacy_context,
+                    memoized(roster, memo, namespace=(people, "roster")),
+                    memoized(section, memo, namespace=(people, "section")),
+                )
+        return read
+
+    people.with_memo = people_with_memo
     context_fn.people = people
     return context_fn
 
@@ -285,11 +323,14 @@ def people_window(messages, query_text: str, *, last: int = 6) -> str:
     return "\n".join(texts)
 
 
-def people_knowledge(context_fn, identity: dict, messages, query_text: str) -> str:
+def people_knowledge(context_fn, identity: dict, messages, query_text: str, *, memo=None) -> str:
     """The '[People in this conversation]' block, or '' (no seam, nobody named, or a failure)."""
     people = getattr(context_fn, "people", None)
     if people is None:
         return ""
+    if memo is not None:
+        factory = getattr(people, "with_memo", None)
+        people = factory(memo) if factory is not None else memoized(people, memo)
     try:
         block = people(str(identity.get("user_id", "")), people_window(messages, query_text),
                        identity.get("privacy_context", "public"))
@@ -376,7 +417,8 @@ def followup_router_for(settings: Settings) -> Callable[[str, str | None], None]
     """Route a spoken follow-up to the right delivery for the ORIGINATING device.
 
     A mapped satellite (device_id in HA_SATELLITE_MAP) gets an assist_satellite
-    announce — the speaker plays it locally, exactly as before. Any OTHER device
+    announce, or start_conversation for a question when keep-listening is ON.
+    Any OTHER device
     (the headless Myo phone satellite, or an unmapped/None device_id) has NO
     announce-able entity: HA would otherwise play a phone turn's follow-up on a
     physical home speaker the remote owner can't hear. Those fire an `aerys_followup`
@@ -393,28 +435,62 @@ def followup_router_for(settings: Settings) -> Callable[[str, str | None], None]
     import httpx
 
     from .speaker_redirect import speaker_redirect_for
+    from .keep_listening import ToggleReader, mark_opened
 
     base = settings.ha_base_url.rstrip("/")
     headers = {"Authorization": f"Bearer {settings.ha_token.get_secret_value()}"}
     satellite_map = satellite_map_from(settings.ha_satellite_map)
     display_map = satellite_map_from(settings.ha_display_followups)
     redirect = speaker_redirect_for(settings)
+    toggle = ToggleReader(settings)
 
     def route(text: str, device_id: str | None) -> None:
+        from .spoken import spoken
+
+        # What's SPOKEN is plain speech (D55: never cut by length; brevity is taught); a display gets
+        # the whole text as written (Codex 11/13).
+        read, text = text, spoken(text)
+        open_mic = bool(device_id and device_id in satellite_map
+                        and text.strip().endswith("?") and toggle.enabled())
         if redirect is not None and redirect.handles(device_id):
             # Speakerless-by-accident satellite (office, 2026-09-26): its follow-up
             # plays on the redirect target instead of a dead speaker.
-            redirect.say(device_id, text)
+            if open_mic:
+                def reopen() -> None:
+                    r = httpx.post(
+                        f"{base}/api/services/assist_satellite/start_conversation",
+                        headers=headers,
+                        json={"entity_id": satellite_map[device_id],
+                              "start_message": OPEN_MIC_MESSAGE, "preannounce": False},
+                        timeout=15.0,
+                    )
+                    r.raise_for_status()
+                    mark_opened(device_id)
+
+                redirect.say(device_id, text, then=reopen)
+            else:
+                redirect.say(device_id, text)
             return
         if device_id and device_id in satellite_map:
-            # Mapped satellite -> announce locally. preannounce=False: no chime
-            # before the follow-up (owner ask 2026-07-04), matching speak_fn_for.
+            from .speaker_redirect import held
+
+            if held(device_id):
+                # 11/14: he stopped her there after this turn began (the button, or "stop" heard by
+                # the satellite itself): what this turn still had to say stays unsaid.
+                log.info("follow-up: hushed on %s since this turn began; not announcing it", device_id)
+                return
+            # Questions can open the mic; all other speech keeps the announce path.
+            # preannounce=False preserves the existing no-chime behavior.
             r = httpx.post(
-                f"{base}/api/services/assist_satellite/announce",
+                f"{base}/api/services/assist_satellite/"
+                + ("start_conversation" if open_mic else "announce"),
                 headers=headers,
-                json={"entity_id": satellite_map[device_id], "message": text,
+                json={"entity_id": satellite_map[device_id],
+                      ("start_message" if open_mic else "message"): text,
                       "preannounce": False},
-                timeout=15.0,
+                # HA answers only once she has finished speaking; with no length cut (D55) a long
+                # answer outlasts 15 s. This runs off the turn's thread, so waiting costs nothing.
+                timeout=httpx.Timeout(90.0, connect=5.0),
             )
         elif device_id and device_id in display_map:
             # Speakerless display (e-ink Sticky) -> WRITE the follow-up to its
@@ -426,7 +502,7 @@ def followup_router_for(settings: Settings) -> Callable[[str, str | None], None]
             r = httpx.post(
                 f"{base}/api/services/{domain}/{service}",
                 headers=headers,
-                json={"message": text},
+                json={"message": read},
                 timeout=15.0,
             )
         else:
@@ -439,6 +515,8 @@ def followup_router_for(settings: Settings) -> Callable[[str, str | None], None]
                 timeout=15.0,
             )
         r.raise_for_status()
+        if open_mic:
+            mark_opened(device_id)
 
     return route
 
@@ -850,7 +928,7 @@ def _safe_display_name(name: object) -> str:
 def action_allowlist_for(settings: Settings) -> frozenset[str] | None:
     """Who may reach the ACTION stack (house control + every tool) — the auth gate
     ask() enforces. The owner is ALWAYS in the set; settings.house_control_person_ids
-    (CSV) adds more (Megan's person_id lands there once her identity is solutioned —
+    (CSV) adds more (his wife's person_id lands there once her identity is solutioned —
     identical house access to Chris). None when no owner is configured (dev boxes):
     the gate in ask() then stays UNENFORCED, same posture as deep_gate_for. Widening
     access is a config edit, never a code change.
@@ -1086,7 +1164,7 @@ def discord_dm_notify_for(settings: Settings) -> Callable[[str], None] | None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return _json.loads(resp.read().decode() or "{}")
 
-    def notify(text: str) -> None:
+    def notify(text: str, key: str | None = None) -> None:   # key: unused, a DM doesn't dedupe
         if not channel_id:
             dm = _post("https://discord.com/api/v10/users/@me/channels",
                        {"recipient_id": recipient})
@@ -1155,6 +1233,10 @@ def remember_writer_for(settings: Settings):
         from aerys_v2.services.memory import embedding_to_pgvector
         from aerys_v2.workers.extraction import triage_memory
 
+        from aerys_v2.services.location_guard import location_memory_blocked, LOCATION_REFUSAL
+
+        if any(location_memory_blocked(v) for v in record.values() if isinstance(v, str)):
+            return LOCATION_REFUSAL
         embedding = embedding_to_pgvector(embed(record["fact"]))
         with psycopg.connect(url, connect_timeout=5, options="-c statement_timeout=5000") as conn:
             action = triage_memory(
@@ -1312,7 +1394,10 @@ def portable_context_fn_for(settings: Settings) -> PortableContextFn | None:
         format_portable_context,
     )
 
+    from aerys_v2.test_bodies import patterns_for
+
     limit = settings.portable_context_limit
+    test_bodies = patterns_for(settings)
 
     def portable(person_id: str) -> str:
         try:
@@ -1324,7 +1409,7 @@ def portable_context_fn_for(settings: Settings) -> PortableContextFn | None:
                 conn.read_only = True
                 rows = conn.execute(
                     PORTABLE_TURNS_SQL,
-                    {"person_id": person_id, "limit": limit},
+                    {"person_id": person_id, "limit": limit, "test_bodies": test_bodies},
                 ).fetchall()
             return format_portable_context(rows)
         except Exception:
@@ -1348,9 +1433,8 @@ def content_privacy_fn_for(settings: Settings) -> ContentPrivacyFn | None:
 
     The keyword pass (services.content_privacy) short-circuits obvious private
     categories with zero model spend; the LLM decides the rest. The judge is a CHEAP
-    metered call (tier_fast_model — haiku), ALWAYS the API backend like
-    build_api_tool_model (the oauth/SDK backend is chat-only and this is a one-word
-    classification, not a conversation), capped at a handful of tokens. It runs on a
+    metered call (tier_fast_model — haiku), ALWAYS the API backend (this is a
+    one-word classification, not a conversation), capped at a handful of tokens. It runs on a
     daemon thread, so its latency never touches a reply; a judge failure fails CLOSED
     to 'private' inside classify_content_privacy. None when no anthropic key can arm a
     judge — the safe direction: without judgment, no DM content is ever relaxed to
@@ -1380,7 +1464,7 @@ def content_privacy_fn_for(settings: Settings) -> ContentPrivacyFn | None:
             "sexual orientation — OR any secret or credential: passwords, passcodes, "
             "PINs, door/garage/gate/alarm codes, wifi passwords, API or private keys, "
             "seed/recovery phrases, account/card/routing numbers, or an exact "
-            "home/street address. A number or a location that is a SECRET is PRIVATE, "
+            "home/street address; where a person is right now: city, street, coordinates, or whereabouts. A number or a location that is a SECRET is PRIVATE, "
             "never public — never treat a code, password, or precise address as a "
             "'general fact'. EVERYTHING ELSE IS PUBLIC: names, jobs, hobbies, "
             "interests, plans, opinions, and ordinary chatter — what someone is doing, "
@@ -1491,6 +1575,7 @@ TIMER_OVERLAY = (
 # the originating device itself. Tool name MUST match tools/music.py's @tool
 # function name — `music` (the V1 toolWorkflow name-mismatch bug, kept dead).
 MUSIC_OVERLAY = (
+    "For no DJ talk tonight or DJ back on, call music operation=dj with query=off or on. "
     "You can play Spotify music on the house speakers with the music tool. Call "
     "music IMMEDIATELY whenever the user asks to play a song, artist, album, or "
     "playlist ('play some daft punk', 'put on my focus playlist'), or to "
@@ -1566,7 +1651,20 @@ MESSAGE_KAEL_OVERLAY = (
     "you, or when something needs his hands NOW. For non-urgent trackable "
     "items keep using log_gap — that's his review board; message_kael is the "
     "tap on the shoulder. One message per 30s; never claim delivery unless "
-    "the tool confirmed it."
+    "the tool confirmed it. Each message opens a ticket (T-12): to check on, "
+    "add to or cancel something you already asked him, use kael_tickets with "
+    "its id instead of sending it again."
+)
+
+REACH_PREFS_OVERLAY = (
+    "The owner steers how often you reach out to him on your own, and about what, in his "
+    "own words. When he says anything like 'ease up', 'chill out', 'you're pinging me a "
+    "lot', 'keep me posted more', 'stop telling me about X', or asks what you'll bring him "
+    "unprompted, CALL reach_prefs (less / more / mute / unmute / show) and tell him plainly "
+    "what changed. When he says he's taking a nap or lying down, CALL reach_prefs nap (with "
+    "minutes if he said how long); when he says he's up, CALL reach_prefs awake. When he says "
+    "people are over, CALL reach_prefs company; when they've left, company_gone. Never claim "
+    "a change the tool didn't confirm."
 )
 
 EMAIL_OVERLAY = (
@@ -1588,15 +1686,29 @@ EMAIL_OVERLAY = (
 # office light on?' — the router acked 'off', then this subgraph, seeing both
 # 'off' and 'on', ASKED 'did you mean on or off?'. The question was announced to
 # a one-way satellite the user can't answer, contradicting the ack already
-# spoken. Rule: on this path, resolve garble toward the ack; never ask.
+# spoken. Resolve garble toward the ack, except unknown recipients must be clarified.
+VOICE_RECIPIENT_RULE = (
+    "Voice transcription can mishear names. If a heard name matches no one you know, "
+    "ask who he meant before sending anything, even after a spoken acknowledgment. "
+    "Never substitute another person or guess a recipient from a similar-sounding name. "
+)
+
 VOICE_ACK_OVERLAY = (
     "This command arrived by VOICE and the user was ALREADY told, out loud: "
     "{ack!r}. This channel is one-way — the user cannot hear or answer a "
-    "question from you, so NEVER ask a clarifying question. Speech-to-text "
+    "question from you, so NEVER ask a clarifying question except for an unknown recipient. Speech-to-text "
     "sometimes garbles a word (e.g. 'one' heard as 'on'); if the wording looks "
     "slightly off or self-contradictory, execute the reading consistent with "
-    "that spoken acknowledgment. Only if the command is truly unexecutable or "
-    "unsafe, call no_action with the problem stated in one plain sentence."
+    "that spoken acknowledgment. If a search on the words you heard finds nothing AND those "
+    "words don't quite make sense together ('the FAA grounding lights'), a word was probably "
+    "misheard: search again with the most likely word ('flights'). If that finds it, say so "
+    "('I think you said flights: ...'); if nothing fits, say you couldn't find it. "
+    "Only if the command is truly unexecutable or "
+    "unsafe, call no_action with the problem stated in one plain sentence. "
+    "Your answer is SPOKEN aloud after that acknowledgment: as plain speech, the answer first, "
+    "never lists, headings, links or markdown. Say less rather than more: two or three sentences "
+    "is usually right, and you may go longer when the answer truly needs it. "
+    + VOICE_RECIPIENT_RULE
 )
 
 
@@ -1609,15 +1721,21 @@ VOICE_ACK_OVERLAY = (
 # unnecessary tool use so banter stays banter (cross-review note: tool-armed
 # graphs drift procedural without a behavioral hint).
 VOICE_BANTER_OVERLAY = (
-    "This is a VOICE conversation. Keep replies concise and speakable. Weave "
+    "This is a VOICE conversation. Keep spoken replies short: a few sentences, "
+    "with the answer first. Say it as plain speech; never read lists, headings or markdown aloud. "
+    "If they ask for detail or the answer truly needs more, you may keep talking over voice. Weave "
     "in ElevenLabs v3 emotion tags — [warmly], [softly], [playfully], "
     "[thoughtfully] — where they fit the feeling; the speech engine performs "
     "them, listeners never hear the bracket text. Their words reach you via "
     "speech-to-text and can be misheard — treat a garbled-seeming line with a "
-    "grain of salt. You have your tools in hand: use one when the request "
+    "grain of salt; if a search on what you heard finds nothing and the words don't quite fit "
+    "together, try the most likely misheard word ('flights' for 'lights') and say that's what "
+    "you searched; if nothing fits, say you couldn't find it. You have your "
+    "tools in hand: use one when the request "
     "actually needs it (a device, a message, a search, a timer), and just "
     "talk when it doesn't — most conversation needs no tool at all. Never "
-    "claim you did something a tool didn't actually do."
+    "claim you did something a tool didn't actually do. "
+    + VOICE_RECIPIENT_RULE
 )
 
 
@@ -1665,6 +1783,25 @@ TYPED_SURFACE_STYLE = (
 )
 
 
+# D79 (Chris 11/20: "its like im talking to twins"): a household DM's chat-shaped turn now runs on this
+# tool-armed graph as conversation, the typed counterpart of VOICE_BANTER_OVERLAY. It carries what the chat
+# node's capability block told her that still holds with tools in hand (durable memory, no invented
+# promises, current facts are looked up rather than guessed), lifts the action overlay's "one short
+# sentence" for talk, and keeps banter from drifting procedural.
+TEXT_BANTER_OVERLAY = (
+    "This is a CONVERSATION in a direct message, and you have your tools in hand. Use one when the "
+    "request actually needs it: a device, a message to send or pass on, a home job, a search, current "
+    "facts (products, prices, hours, anything after your knowledge cutoff), a file or link. Just talk "
+    "when it doesn't; most conversation needs no tool at all. The one-short-sentence rule above is for "
+    "confirming an act you just did with a tool; otherwise answer the way you normally would in this "
+    "conversation, as long as it needs. Never say you did, started, sent or checked something unless a "
+    "tool did it this turn, and never say how something stands now unless you looked. Your conversation "
+    "memory is durable across restarts and sessions, and you also know long-term facts about the person. "
+    "Never say someone promised, agreed to or owes you something, or that you are waiting on something "
+    "from them, unless it is in front of you; if you are not sure, ask."
+)
+
+
 SPECIALIST_CHARTER = (
     "You are the tool specialist acting for Aerys, the household assistant — her "
     "hands, not her conversational voice. You get ONE job per turn: the user's "
@@ -1674,9 +1811,11 @@ SPECIALIST_CHARTER = (
     "a tool result. Never say you cannot do something unless a tool refused it on "
     "this turn; relay refusals exactly (what, why). If the request needs no tool — "
     "it is a question you must ask back, or it is outside your tools — call "
-    "no_action with the sentence you will say; never fake a result. Prior "
-    "requests, if shown, exist only to resolve references like 'them' or 'that "
-    "one'. Reply length follows the job: a device confirmation or a reading is one "
+    "no_action with the sentence you will say; never fake a result. The "
+    "conversation before the request is context, not more things to do: do only "
+    "the request at the end. What you said earlier about what you can or can't "
+    "do is not a fact; the tools decide, so try the tool. A question about what "
+    "you already did is answered from the records, never by doing it again. Reply length follows the job: a device confirmation or a reading is one "
     "or two plain sentences; a summary, a search answer, or a document read takes "
     "the length it needs. Write the reply as Aerys would say it: first person, "
     "she/her, warm and direct, no preamble, no apology, no mention of internal "
@@ -1706,6 +1845,44 @@ LOCAL_ACTION_HARDENING = (
 )
 
 
+def is_lifeboat_failure(e: BaseException) -> bool:
+    """A tool-model failure the local lifeboat answers: the connection or the server
+    side died. Client status errors (4xx, 429) and programming errors keep their
+    meaning and are raised. Used by the action middleware."""
+    from aerys_v2.oauth_model import OAuthBackendError
+
+    if isinstance(e, anthropic.APIStatusError):
+        return not (isinstance(e, anthropic.RateLimitError) or e.status_code < 500)
+    return isinstance(e, (
+        anthropic.APIConnectionError, anthropic.APITimeoutError,
+        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+        OAuthBackendError,  # the subscription client died twice — same class as a connection failure
+    ))
+
+
+def lifeboat_fired(e: BaseException) -> None:
+    """Mark the turn as answered by the local lifeboat (degraded marker + receipt)."""
+    log.warning(
+        "local_model_fallback: tool call failed (%s) — answering on the local tool model",
+        type(e).__name__,
+    )
+    LOCAL_FALLBACK_FIRED.set(True)
+    receipt = _LOCAL_TOOL_FALLBACK.get()
+    if receipt is not None:
+        receipt.append(True)
+
+
+#: The tool lifeboat's tools (Chris 2026-10-26: "house controls only honestly makes sense. general
+#: web related tools would be unavailable anyways if she cant reach her API"). All 23 tool schemas
+#: were ~6k of the lifeboat's 10.5k-token prompt; these are the ones that work with the internet down.
+LIFEBOAT_TOOLS = frozenset({
+    "home_control", "search_entities", "timer", "control_alarm", "sticky_note", "manage_list", "no_action",
+})
+
+
+# The tool-model helpers below are no longer used by the rack's action engine (create_agent, built from
+# action_loop.build_agent_tool_models). They stay, unchanged, because Aerys Portable's hands and body
+# import build_api_tool_model and ToolModelPair from here (aerys_portable/hands, body/compose.py).
 class LocalToolFailoverModel:
     """A bound Anthropic primary with a connection/server-failure tool lifeboat.
 
@@ -1720,28 +1897,12 @@ class LocalToolFailoverModel:
         # Same positional shape as a LangChain Runnable (Gemini re-review 9/05).
         if config is not None:
             kwargs["config"] = config
-        from aerys_v2.oauth_model import OAuthBackendError
-
         try:
             return self.primary.invoke(messages, **kwargs)
-        except (
-            anthropic.APIConnectionError, anthropic.APITimeoutError,
-            anthropic.APIStatusError,
-            httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
-            OAuthBackendError,  # the subscription client died twice — same class as a connection failure
-        ) as e:
-            if isinstance(e, anthropic.APIStatusError) and (
-                isinstance(e, anthropic.RateLimitError) or e.status_code < 500
-            ):
+        except Exception as e:
+            if not is_lifeboat_failure(e):
                 raise
-            log.warning(
-                "local_model_fallback: tool call failed (%s) — answering on the local tool model",
-                type(e).__name__,
-            )
-            LOCAL_FALLBACK_FIRED.set(True)
-            receipt = _LOCAL_TOOL_FALLBACK.get()
-            if receipt is not None:
-                receipt.append(True)
+            lifeboat_fired(e)
             prompt = lifeboat_prompt(messages, hardening=LOCAL_ACTION_HARDENING)
             return self.lifeboat.invoke(prompt, **kwargs)
 
@@ -1906,47 +2067,57 @@ def _build_tool_model(settings: Settings, tools: list, *, timeout_s: float, back
     return ToolModelPair(conversational, std_auto, std_forced, fast_auto, fast_forced)
 
 
-def build_action_graph(
-    api_model_with_tools: object,
+def one_loop_note(configurable: dict) -> str:
+    """D79: the internal note for one pass of a one-loop turn: what she already did this turn (a reply-only
+    pass after an act) and what to fix. Empty when there is none. System prompt only, never history."""
+    done = str((configurable or {}).get("one_loop_done") or "").strip()
+    correction = str((configurable or {}).get("one_loop_correction") or "").strip()
+    if not done and not correction:
+        return ""
+    parts = ["\n\n[For this reply only. Internal: never mention this note.]"]
+    if done:
+        parts.append(f"Already done this turn, and finished (do not do any of it again):\n{done}")
+    if correction:
+        parts.append(correction)
+    return "\n".join(parts)
+
+
+def _action_prompt_builder(
     soul: str,
-    tools: list,
-    context_fn: ContextFn | None = None,
-    overlay: str = ACTION_OVERLAY,
-    family_notes_fn=None,
-    room_context_fn: RoomContextFn | None = None,
-    portable_context_fn: PortableContextFn | None = None,
-    presence_fn=None,
-    voice_room_fn=None,
-    shared_surface_ids: dict | None = None,
-    charter: str = SPECIALIST_CHARTER,
-    checkpointer=None,
-    context_trailing: bool = False,
-) -> object:
-    """START → act ⇄ tools → END: the tool subgraph for device commands.
+    *,
+    charter: str,
+    overlay: str,
+    context_fn: ContextFn | None,
+    family_notes_fn,
+    room_context_fn: RoomContextFn | None,
+    portable_context_fn: PortableContextFn | None,
+    presence_fn,
+    voice_room_fn,
+    shared_surface_ids: dict | None,
+    context_trailing: bool,
+    conversational_context_fn: ContextFn | None = None,
+):
+    """The action mind's prompt for one create_agent model pass. Returns
+    fn(messages, config) -> (prompt, specialist, fast).
 
-    n8n mapping: this is the AI Agent node with an ai_tool connection — the
-    model proposes tool_calls, ToolNode (LangGraph prebuilt) executes them and
-    feeds ToolMessages back, and the loop repeats until the model answers in
-    plain text. The recursion_limit rail from ask() applies here too: each
-    act/tools hop is a super-step, so a confused model hits the wall instead of
-    incinerating budget (the dormant turn_limit in Rails, now live).
+    conversational_context_fn (D79): her FULL long-term memory (embedding-backed, the chat node's
+    seam) for a one-loop conversation turn (configurable text_one_loop, not specialist). Every other
+    turn keeps context_fn, the profile-only seam, exactly as before."""
 
-    By default there is no checkpointer — an action turn is a one-shot; the durable
-    record is (a) the outbox row the tool wrote and (b) the final AIMessage
-    that service.py appends to the MAIN thread's checkpointer.
-    """
-    from langgraph.prebuilt import ToolNode
-
-    def act(state: ChatState, config: RunnableConfig) -> dict:
+    def assemble(messages: list, config: RunnableConfig) -> tuple[list, bool, bool]:
         # Same identity rule as the chat node: from per-call config, never state.
         identity = identity_from_config(config)
+        turn_overlay = overlay(config) if callable(overlay) else overlay
         # SPECIALIST MODE (2026-09-04) rides `configurable` like spoken_ack: set by
         # service.py on ACTION routes only. On: the charter replaces the soul and
         # the first pass must call a tool. Off (voice banter — every voice turn
         # runs this graph, conversation included): the soul, free model, exactly
         # as before. One compiled graph, two shapes, chosen per call.
         configurable = config.get("configurable") or {}
+        memo = configurable.get("action_context_memo")
         specialist = bool(configurable.get("specialist"))
+        # D79: a one-loop conversation turn (service._text_one_loop_turn) — never a specialist turn.
+        one_loop = bool(configurable.get("text_one_loop")) and not specialist
         fast = configurable.get("tier") == "fast"  # the router's grade rides in
         persona = charter if specialist else soul
         caller_line = (
@@ -1973,6 +2144,16 @@ def build_action_graph(
             # The typed counterpart, same reason as the chat node: this mind shares
             # the same person-keyed thread, so it inherits the same voice precedent.
             ack_block = TYPED_SURFACE_STYLE
+            if one_loop:
+                # D79: a household DM's conversation on this graph: her typed banter voice.
+                ack_block = f"{ack_block}\n\n{TEXT_BANTER_OVERLAY}"
+                # D79 (Codex 11/20 #2): a correction for THIS pass rides the system prompt, never the
+                # history, so his turn stays the latest human turn (a relay before it still taints).
+                ack_block += one_loop_note(configurable)
+            elif specialist:
+                # D79 on the action path (service._judged_action_pass): an action-routed household DM's
+                # correction rides the system prompt the same way. Empty on every other specialist turn.
+                ack_block += one_loop_note(configurable)
         else:
             ack_block = ""
         # Lens surface rides on top of (and after) the voice styling so its
@@ -1987,9 +2168,11 @@ def build_action_graph(
         # the range math. context_fn here is the PROFILE-ONLY seam (identity
         # claims, no embedding call) — same graceful contract as the chat node.
         knowledge = ""
-        if context_fn is not None:
+        # D79: a one-loop conversation gets her full memory, as the chat node did (Codex 11/20 #2).
+        memory_fn = conversational_context_fn if (one_loop and conversational_context_fn is not None) else context_fn
+        if memory_fn is not None:
             latest = next(
-                (m for m in reversed(state["messages"]) if getattr(m, "type", "") == "human"),
+                (m for m in reversed(messages) if getattr(m, "type", "") == "human"),
                 None,
             )
             query_text = ""
@@ -1997,7 +2180,7 @@ def build_action_graph(
                 content = latest.content
                 query_text = content if isinstance(content, str) else str(content)
             try:
-                block = context_fn(
+                block = memoized(memory_fn, memo)(
                     str(identity.get("user_id", "")),
                     query_text,
                     identity.get("privacy_context", "public"),
@@ -2007,11 +2190,11 @@ def build_action_graph(
                 block = ""
             if block:
                 knowledge = f"\n\n[What you know about this person]\n{block}"
-            knowledge += people_knowledge(context_fn, identity, state["messages"], query_text)
+            knowledge += people_knowledge(memory_fn, identity, messages, query_text, memo=memo)
         # Same clock+location the chat node injects, so a time/where question answers
         # identically whichever path the router chose. Its absence here is exactly why
         # "what time is it" web-searched on the tool path and punted to the lock screen.
-        where_when = _where_when_line(thread, identity)
+        where_when = _where_when_line(thread, identity) + _reach_feedback_line(messages)
         # Family splice on the ACTION mind too (owner nit, 2026-08-05): voice and
         # glasses turns ALWAYS run this graph, and those are exactly the surfaces
         # where the owner most tells her to reach Kael — chat-only would put the
@@ -2019,25 +2202,32 @@ def build_action_graph(
         family = ""
         if family_notes_fn is not None:
             try:
-                family = family_notes_fn(identity) or ""
+                family = memoized(family_notes_fn, memo)(identity) or ""
             except Exception:
                 log.warning("action family_notes_fn raised; continuing without", exc_info=True)
         shared = _shared_surface_note(identity, shared_surface_ids or {})
         # The room, on her HANDS as well as her voice: a job asked in a shared
         # channel needs the channel as much as a conversation does.
-        room = room_block(identity, room_context_fn,
+        room = room_block(identity, memoized(room_context_fn, memo),
                           ((config or {}).get("configurable") or {}).get("room_sink"))
         # Her other bodies, on her hands too: a job asked here may continue one begun
         # on the stick, and "do the thing I asked you about last night" has to resolve.
-        portable = portable_block(identity, portable_context_fn)
+        portable = portable_block(identity, memoized(portable_context_fn, memo))
         # Ambient house presence (her gap #101, passive half). The helper owns the
         # owner-and-private fence — presence disclosure is a gated surface.
-        presence = presence_block(identity, presence_fn)
+        presence = presence_block(identity, memoized(
+            presence_fn, memo,
+            # A valid snapshot can have no occupied rooms but still locate the caller.
+            # Failed HA reads have neither rooms nor these fields; retry those.
+            cache_if=lambda value: bool(value or getattr(value, "whereabouts", None)
+                                       or getattr(value, "city", None)
+                                       or getattr(value, "local_zone", None)),
+        ))
         # What this satellite has heard lately — owner's voice turns only; the helper
         # owns that fence (Chris asked for it and asked that guests not get it).
-        voice_room = voice_room_block(identity, voice_room_fn)
-        # act runs once per model pass; context is computed once per node call,
-        # then attached to a fresh copy, never accumulated in the tool-loop state.
+        voice_room = voice_room_block(identity, memoized(voice_room_fn, memo))
+        # Helpers run every pass; only exact raw reads share the per-invoke memo.
+        # Context attaches to a fresh copy, never accumulating in tool-loop state.
         # The spoken-ack overlay quotes THIS turn's generated ack, so it is
         # per-turn text and rides with the dynamic block; the other ack_block
         # variants (banter / typed / lens styling) are per-surface and stay in
@@ -2046,49 +2236,77 @@ def build_action_graph(
         static_ack, dynamic_ack = ("", ack_block) if spoken_ack else (ack_block, "")
         if context_trailing:
             prompt = prompt_with_context(
-                f"{persona}\n\n{overlay}{static_ack}", state["messages"],
+                f"{persona}\n\n{turn_overlay}{static_ack}", messages,
                 f"{dynamic_ack}{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}{shared}",
             )
         else:
             # The pre-2026-09-19 layout, byte for byte: every block in the
             # system prompt, ahead of the history.
             system = SystemMessage(
-                content=f"{persona}\n\n{overlay}{ack_block}\n{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}{shared}"
+                content=f"{persona}\n\n{turn_overlay}{ack_block}\n{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}{shared}"
             )
-            prompt = [system, *state["messages"]]
+            prompt = [system, *messages]
         # The current turn's image, for her tool-using side too (board #28, 2026-09-29):
         # a Telegram photo has no URL for analyze_image, so a photo whose words ask for
         # a tool ("search where to buy this") was invisible here. Same inlining as chat.
         from aerys_v2.images import inline_current_images
 
-        prompt = inline_current_images(prompt)
-        if isinstance(api_model_with_tools, ToolModelPair):
-            reply = api_model_with_tools.invoke(prompt, specialist=specialist, fast=fast)
+        if memo is None:
+            prompt = inline_current_images(prompt)
         else:
-            reply = api_model_with_tools.invoke(prompt)
-        return {"messages": [reply]}
+            from aerys_v2.images import fetch_image
 
-    def after_act(state: ChatState) -> str:
-        # tool_calls present -> execute them; plain text -> the turn is done.
-        last = state["messages"][-1]
-        calls = getattr(last, "tool_calls", None)
-        if calls:
-            # her panel status line names what she is about to do (tool names only)
-            from .panel_corner import report_activity
+            prompt = inline_current_images(prompt, fetch=memoized(fetch_image, memo))
+        return prompt, specialist, fast
 
-            report_activity([c.get("name", "") for c in calls if isinstance(c, dict)])
-        return "tools" if calls else END
+    def build(messages: list, config: RunnableConfig) -> tuple[list, bool, bool]:
+        started = perf_counter()
+        try:
+            return assemble(messages, config)
+        finally:
+            log.debug("action prompt built in %.2f ms (memo=%s)",
+                      (perf_counter() - started) * 1000,
+                      "action_context_memo" in (config.get("configurable") or {}))
 
-    graph = StateGraph(ChatState)
-    graph.add_node("act", act)
-    graph.add_node("tools", ToolNode(tools))
-    graph.add_edge(START, "act")
-    graph.add_conditional_edges("act", after_act, {"tools": "tools", END: END})
-    graph.add_edge("tools", "act")
-    return graph.compile(checkpointer=checkpointer)
+    return build
 
 
-def action_tools_for(settings: Settings, *, guest: bool = False) -> list:
+def build_action_graph(
+    api_model_with_tools: object,
+    soul: str,
+    tools: list,
+    context_fn: ContextFn | None = None,
+    overlay: str = ACTION_OVERLAY,
+    family_notes_fn=None,
+    room_context_fn: RoomContextFn | None = None,
+    portable_context_fn: PortableContextFn | None = None,
+    presence_fn=None,
+    voice_room_fn=None,
+    shared_surface_ids: dict | None = None,
+    charter: str = SPECIALIST_CHARTER,
+    checkpointer=None,
+    context_trailing: bool = False,
+    outside_gate=None,
+    guard_owner=None,
+    *,
+    extra_middleware=(),
+    conversational_context_fn: ContextFn | None = None,
+) -> object:
+    """Build the sole action engine, retaining the public builder's call signature."""
+    from aerys_v2.action_loop import build_agent_action_graph
+
+    return build_agent_action_graph(
+        api_model_with_tools, soul, tools, context_fn=context_fn, overlay=overlay,
+        conversational_context_fn=conversational_context_fn,
+        family_notes_fn=family_notes_fn, room_context_fn=room_context_fn,
+        portable_context_fn=portable_context_fn, presence_fn=presence_fn,
+        voice_room_fn=voice_room_fn, shared_surface_ids=shared_surface_ids,
+        charter=charter, checkpointer=checkpointer, context_trailing=context_trailing,
+        outside_gate=outside_gate, guard_owner=guard_owner, extra_middleware=extra_middleware,
+    )
+
+
+def action_tools_for(settings: Settings, *, guest: bool = False, reach_desk=None) -> list:
     """Every tool the action subgraph gets, assembled from what Settings arms.
 
     Two independently-armed halves, same pattern as every optional transport:
@@ -2108,7 +2326,7 @@ def action_tools_for(settings: Settings, *, guest: bool = False) -> list:
 
     Empty list = nothing armed = the caller keeps ask() chat-only.
     """
-    tools = _action_tools_armed(settings, guest=guest)
+    tools = _action_tools_armed(settings, guest=guest, reach_desk=reach_desk)
     if tools:
         # The forced first pass's honest exit (see tools/no_action.py). Appended
         # only when something real is armed, so an empty box stays chat-only.
@@ -2117,7 +2335,7 @@ def action_tools_for(settings: Settings, *, guest: bool = False) -> list:
     return tools
 
 
-def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
+def _action_tools_armed(settings: Settings, *, guest: bool = False, reach_desk=None) -> list:
     tools: list = []
 
     if not guest and settings.ha_token is not None:
@@ -2128,6 +2346,7 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             room_aliases as _room_aliases,
         )
 
+        private_entities = tuple(p.strip() for p in settings.ha_private_entities.split(",") if p.strip())
         conn_factory = None
         if settings.database_url is not None:
             import psycopg
@@ -2144,12 +2363,26 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
                 canary_entities=canary_set(settings.ha_canary_entities),
                 conn_factory=conn_factory,
                 aliases=_room_aliases(settings.ha_room_aliases),
+                his_places=frozenset(e.strip() for e in (
+                    settings.presence_person_entity,
+                    settings.presence_geocoded_entity,
+                    settings.presence_coords_entity,
+                ) if e.strip()),
+                private_entities=private_entities,
+                owner_person_id=str(settings.owner_person_id or ""),
             )
         )
         tools.append(
             build_search_entities_tool(
                 base_url=settings.ha_base_url,
                 token=settings.ha_token.get_secret_value(),
+                his_places=frozenset(e.strip() for e in (
+                    settings.presence_person_entity,
+                    settings.presence_geocoded_entity,
+                    settings.presence_coords_entity,
+                ) if e.strip()),
+                private_entities=private_entities,
+                owner_person_id=str(settings.owner_person_id or ""),
             )
         )
         # The timer tool rides the same HA door (base_url + token) as home_control
@@ -2178,8 +2411,21 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
                 base_url=settings.ha_base_url,
                 token=settings.ha_token.get_secret_value(),
                 entity_id=settings.ha_weather_entity,
+                nws_point=settings.storm_watch_latlon,
             )
         )
+
+        if settings.presence_geocoded_entity.strip():
+            from aerys_v2.tools.whereabouts import build_whereabouts_tool
+
+            tools.append(build_whereabouts_tool(
+                base_url=settings.ha_base_url,
+                token=settings.ha_token.get_secret_value(),
+                person_entity=settings.presence_person_entity.strip(),
+                geocoded_entity=settings.presence_geocoded_entity.strip(),
+                owner_person_id=settings.owner_person_id,
+                coords_entity=settings.presence_coords_entity.strip(),
+            ))
 
         if settings.ha_alarm_entity:
             # ALARM (owner-commissioned 2026-08-07): same HA door, but its own
@@ -2235,11 +2481,15 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             # is deliberately off the table.
             from aerys_v2.tools.calendar_events import build_calendar_tool, calendar_set
 
+            from aerys_v2.services.presence import current_travel_zone
+
             tools.append(
                 build_calendar_tool(
                     base_url=settings.ha_base_url,
                     token=settings.ha_token.get_secret_value(),
                     entities=calendar_set(settings.ha_calendar_entities),
+                    # Only the zone presence_block showed this turn: same fence, no extra read.
+                    local_zone_fn=current_travel_zone if settings.presence_timezone_entity.strip() else None,
                 )
             )
 
@@ -2249,14 +2499,19 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             # the origin-device default reuses the HA_SATELLITE_MAP csv parser —
             # one format for every device_id=entity map.
             from aerys_v2.tools.music import build_music_tool
+            from aerys_v2.tools.music_mcp import ma_for
+            from aerys_v2.dj import store_for
 
             tools.append(
                 build_music_tool(
                     base_url=settings.ha_base_url,
                     token=settings.ha_token.get_secret_value(),
                     config_entry_id=settings.ha_music_config_entry,
+                    dj_store=store_for(settings.database_url),
                     players=satellite_map_from(settings.ha_music_players),
                     default_player=settings.ha_music_default_player,
+                    owner_person_id=str(settings.owner_person_id or "") or None,
+                    ma=ma_for(settings),       # D53: likes, library, playlists, the real queue
                 )
             )
 
@@ -2307,7 +2562,27 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
 
         tools.append(build_log_gap_tool(gaps_conn_factory))
 
+    if not guest and (settings.tavily_api_key is not None or settings.firecrawl_api_key is not None):
+        # CART LINKS (D39, 2026-11-12): owner-side, and only beside the web tools she needs
+        # to find the exact product; with no web armed there is nothing to build a link from.
+        from aerys_v2.tools.cart_link import build_cart_link_tool
+        from aerys_v2.kael_line import _discord_dm_send
+
+        tools.append(build_cart_link_tool(
+            settings, send=_discord_dm_send if settings.discord_bot_token else None))
+
     if not guest:
+        from aerys_v2.approvals import approvals_for
+        from aerys_v2.tools.pending_requests import build_pending_requests_tool
+
+        approvals = approvals_for(settings)
+        if approvals is not None:
+            tools.append(build_pending_requests_tool(approvals))
+        # D14 (11/09; built 11/15): she reads her own code, read-only, to point at the line that failed.
+        if settings.owner_person_id is not None:
+            from aerys_v2.tools.my_code import build_read_my_code_tool
+
+            tools.append(build_read_my_code_tool(settings.owner_person_id))
         # REMEMBER (2026-09-06): she keeps a fact on purpose, through the same
         # writer the extractor uses. Owner-side only (a guest must not write
         # into the owner's memory); armed exactly when the writer can be built.
@@ -2316,6 +2591,68 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             from aerys_v2.tools.remember import build_remember_tool
 
             tools.append(build_remember_tool(remember_writer, key_labeler=memory_key_labeler_for(settings)))
+        # CONTACTS (D29, 2026-11-11): his words attach an email address to a person's record, which is
+        # what the email tool's known-recipient check reads. Owner-only; the guard holds it after outside text.
+        if settings.memories_database_url and settings.owner_person_id is not None:
+            from aerys_v2.tools.contacts import PostgresContacts, build_contact_tool
+
+            contacts = PostgresContacts(settings.memories_database_url)
+            owner = str(settings.owner_person_id)
+            tools.append(build_contact_tool(contacts, owner_person_id=owner,
+                                            owner_names=lambda: contacts.names_of(owner)))
+
+    if guest:
+        from aerys_v2.tools.pass_to_chris import relay_for, build_pass_to_chris_tool, build_relay_status_tool
+        relay = relay_for(settings, reach_desk)
+        if relay is not None:
+            tools.extend([build_pass_to_chris_tool(relay), build_relay_status_tool(relay)])
+            from aerys_v2.tools.report_to_kael import build_report_to_kael_tool, reports_for
+            tools.append(build_report_to_kael_tool(reports_for(settings, relay)))
+
+    message_sender = None
+    if not guest:
+        from aerys_v2.tools.send_message import build_send_message_tool, build_messages_sent_tool
+        if getattr(settings, "messages_as_herself", False):
+            from aerys_v2.hands_gate import hands_gate_for
+            message_gate = hands_gate_for(settings)
+            sender = message_sender = getattr(message_gate, "message_sender", None)
+            if sender is not None:
+                tools.extend([build_send_message_tool(sender), build_messages_sent_tool(sender)])
+            else:
+                log.info("send_message not armed: gate or required messaging configuration unavailable")
+        else:
+            log.info("send_message not armed: MESSAGES_AS_HERSELF is off")
+
+    if not guest and settings.database_url:
+        # REACH PREFS (board #176, Stage 2; the owner's D4/D7, 2026-11-08): he steers how
+        # often she reaches out on her own, and about what, in his own words; the reach-out
+        # desk (reach.py) enforces it in code. Owner-side only: it's his inbox she's managing.
+        from aerys_v2.reach import PostgresReachStore
+        from aerys_v2.tools.reach_prefs import build_reach_prefs_tool
+
+        tools.append(build_reach_prefs_tool(PostgresReachStore(settings.database_url),
+                                            default_budget=settings.reach_daily_budget))
+        if settings.followups:
+            # CHECK BACK (board #176, Stage 2; the owner's C, 11/08): when he says yes to her
+            # offer, or asks her to check on him, she writes it down here and the follow-ups
+            # runner (followups.py) brings it back at its time through the desk.
+            from aerys_v2.followups import PostgresFollowupStore, build_check_back_tool
+
+            tools.append(build_check_back_tool(PostgresFollowupStore(settings.database_url),
+                                               withdraw=PostgresReachStore(settings.database_url).withdraw))
+        if settings.wakeups:
+            # HER WAKE-UPS (D40/D41, 11/12): she sets herself a later check, for any task, and the
+            # wake-ups runner (wakeups.py) runs it as an unattended action turn at its time.
+            from aerys_v2.wakeups import PostgresWakeupStore, WakeRails, build_wake_me_tool
+
+            wake_store = PostgresWakeupStore(settings.database_url)
+            if message_sender is not None:
+                # D42 (11/13): a message he asks for when a wake-up is set goes at its time, untapped.
+                message_sender.wake_store = wake_store
+                log.info("D42: a message he asks for when a wake-up is set goes untapped")
+            tools.append(build_wake_me_tool(wake_store, rails=WakeRails.from_settings(settings),
+                                            owner_person_id=str(settings.owner_person_id or ""),
+                                            pin=message_sender.pin_recipient if message_sender is not None else None))
 
     if not guest and settings.kael_desk_url and settings.kael_desk_token is not None:
         # KAEL DESK LINE (gap #14, her own ask 2026-07-25): real-time pings into
@@ -2325,10 +2662,24 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
         # the durable board; this is the shoulder-tap.
         from aerys_v2.tools.message_kael import build_message_kael_tool
 
+        ticket_store = None
+        if settings.database_url:
+            # KAEL TICKETS (board #176): every message opens a ticket, so what she asks
+            # comes back, and what the owner asked comes back to him (tickets.py).
+            from aerys_v2.tickets import PostgresTicketStore, line_sender
+            from aerys_v2.tools.kael_tickets import build_kael_tickets_tool
+
+            ticket_store = PostgresTicketStore(settings.database_url)
+            tools.append(build_kael_tickets_tool(
+                ticket_store,
+                line_sender(settings.kael_desk_url, settings.kael_desk_token.get_secret_value()),
+            ))
         tools.append(
             build_message_kael_tool(
                 settings.kael_desk_url,
                 settings.kael_desk_token.get_secret_value(),
+                tickets=ticket_store,
+                owner_person_id=settings.owner_person_id,
             )
         )
         if settings.database_url:
@@ -2339,6 +2690,18 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             from aerys_v2.tools.kael_checkins import build_kael_checkins_tool
 
             tools.append(build_kael_checkins_tool(PostgresCheckinStore(settings.database_url)))
+
+    if not guest and settings.ha_token is not None:
+        # Keep listening (11/11): his voice switch for input_boolean.aerys_keep_listening.
+        from aerys_v2.keep_listening import build_keep_listening_tool
+
+        tools.append(build_keep_listening_tool(settings))
+
+    if not guest:
+        from aerys_v2.tools.gmail_drafts import gmail_tools_for
+
+        tools.extend(gmail_tools_for(settings))
+
 
     if not guest and settings.email_app_password is not None and settings.email_address:
         # EMAIL (her own mailbox, 2026-07-11 scope) — owner-side only, like HOME:
@@ -2366,11 +2729,13 @@ def _action_tools_armed(settings: Settings, *, guest: bool = False) -> list:
             client.login(_a, _p)
             return client
 
+        from aerys_v2.hands_gate import people_lookup_for
         tools.extend(
             build_email_tools(
                 imap_factory=imap_factory,
                 smtp_factory=smtp_factory,
                 self_address=addr,
+                people=people_lookup_for(settings),
             )
         )
 
@@ -2388,6 +2753,15 @@ def action_overlay_for(settings: Settings, *, guest: bool = False) -> str:
     doesn't).
     """
     parts = []
+    if not guest and (settings.tavily_api_key is not None or settings.firecrawl_api_key is not None):
+        parts.append(
+            "When he asks to put a product in his Amazon or Walmart cart, find the exact product "
+            "page with your web tools, then call add_to_cart_link; if you cannot find "
+            "the exact product, ask. Never make a cart link yourself or present a web page's link "
+            "as a cart link. Amazon's cart link only adds items sold by Amazon.com itself; when the "
+            "listing shows another seller or you can't tell, use kind='product_page'. "
+            "On voice or the glasses call the tool (it sends to his Discord); "
+            "on text give him its exact link in the reply. Relay any sending failure honestly.")
     if not guest and settings.ha_token is not None:
         parts.append(ACTION_OVERLAY)
         parts.append(TIMER_OVERLAY)
@@ -2405,9 +2779,26 @@ def action_overlay_for(settings: Settings, *, guest: bool = False) -> str:
         parts.append(REMEMBER_OVERLAY)
     if not guest and settings.kael_desk_url and settings.kael_desk_token is not None:
         parts.append(MESSAGE_KAEL_OVERLAY)
+    if not guest and settings.database_url:
+        parts.append(REACH_PREFS_OVERLAY)
+        if settings.followups:
+            from aerys_v2.followups import CHECK_BACK_OVERLAY
+
+            parts.append(CHECK_BACK_OVERLAY)
+        if settings.wakeups:
+            from aerys_v2.wakeups import WAKE_ME_OVERLAY
+
+            parts.append(WAKE_ME_OVERLAY)
     if not guest and settings.email_app_password is not None and settings.email_address:
         parts.append(EMAIL_OVERLAY)
     return "\n\n".join(parts)
+
+
+def _action_engine(settings: Settings, tools: list) -> tuple[object, Callable[..., object]]:
+    """Unbound models and the create_agent builder for every action turn."""
+    from aerys_v2.action_loop import build_agent_tool_models
+
+    return build_agent_tool_models(settings, tools), build_action_graph
 
 
 def action_stack_for(settings: Settings, soul: str, room_context_fn: RoomContextFn | None = None, portable_context_fn: PortableContextFn | None = None) -> tuple | None:
@@ -2425,12 +2816,42 @@ def action_stack_for(settings: Settings, soul: str, room_context_fn: RoomContext
 
     from aerys_v2.kael_line import family_notes_fn_for
 
-    action_graph = build_action_graph(
-        build_api_tool_model(settings, tools),
+    models, build = _action_engine(settings, tools)
+    # Her long jobs at home (home_jobs.py, s3-02): on the new loop only, behind the D10 gate.
+    # None (the usual case) changes nothing: same overlay, same middleware, same graph.
+    home_jobs = None
+    if getattr(settings, "home_jobs", False):
+        from aerys_v2.home_jobs import home_jobs_for
+
+        home_jobs = home_jobs_for(settings)
+    overlay = action_overlay_for(settings)
+    extra = {}
+    if home_jobs is not None:
+        overlay = "\n\n".join(part for part in (overlay, home_jobs.overlay) if part)
+        extra["extra_middleware"] = home_jobs.middleware
+    skill_layers = None
+    if settings.her_skills and settings.database_url:
+        from aerys_v2.skills import BodySkillsBackend, feed_loader, skills_middleware, store_for
+
+        # D67 (11/18): her bodies' skills, as they reach the house through the door, read-only beside her own.
+        skill_layers = skills_middleware(store_for(settings), settings.owner_person_id,
+                                         body_skills=BodySkillsBackend(feed_loader(settings)))
+        extra["extra_middleware"] = [*extra.get("extra_middleware", ()), *skill_layers]
+    from aerys_v2.hands_gate import hands_gate_for, HandsWatcher
+    from aerys_v2.outside_guard import OUTSIDE_ACTION, action_executor
+    outside_gate = home_jobs.gate if home_jobs is not None else hands_gate_for(settings)
+    if outside_gate is not None:
+        outside_gate.executors[OUTSIDE_ACTION] = action_executor(tools, skill_middleware=skill_layers)
+    extra.update(outside_gate=outside_gate, guard_owner=str(settings.owner_person_id or ""))
+    action_graph = build(
+        models,
         soul,  # used by voice banter turns; action routes swap in the charter per call
         tools,
         context_fn=context_fn_for(settings, profile_only=True),
-        overlay=action_overlay_for(settings),
+        # D79: her full memory for a household DM's conversation on this graph (Codex 11/20 #2). Only
+        # the main graph: the guest and wake graphs keep the profile-only seam.
+        conversational_context_fn=context_fn_for(settings),
+        overlay=overlay,
         # Owner nit 8/05: voice/glasses ALWAYS run this graph — the family
         # splice must ride it or it misses the surfaces that matter most.
         # The fn owner-gates itself; the guest graph below stays unwired.
@@ -2444,7 +2865,45 @@ def action_stack_for(settings: Settings, soul: str, room_context_fn: RoomContext
         voice_room_fn=voice_room_fn_for(settings),
         portable_context_fn=portable_context_fn,
         context_trailing=settings.prompt_context_trailing,
+        **extra,
     )
+    from aerys_v2.dj import store_for
+
+    action_graph.dj_store = store_for(settings.database_url)
+    # D79: the honesty judge on her one-loop replies (Jev on the reflex's key; None without one). It can
+    # never take the tool stack down: a judge that won't build is None, i.e. judge_unavailable on each turn.
+    try:
+        from aerys_v2.honesty_judge import judge_for
+
+        action_graph.honesty_judge = judge_for(settings)
+    except Exception:
+        log.warning("honesty judge: couldn't build it; one-loop replies go out marked judge_unavailable",
+                    exc_info=True)
+        action_graph.honesty_judge = None
+    # --serve starts the D10 gate's watcher from here (one per brain, with the note injector).
+    action_graph.home_jobs = home_jobs
+    action_graph.hands_watcher = (home_jobs.watcher if home_jobs is not None else
+                                  HandsWatcher(outside_gate) if outside_gate is not None else None)
+    # HER WAKE-UPS (wakeups.py; D40/D41, 11/12): a wake turn runs unattended on a graph of its own,
+    # built here by the same builder from these same tools (the guest graph's pattern), with her
+    # memory taken out and the house tools' writes refused (wake_tools), behind this same gate seen
+    # through WakeGate. The outside guard runs before any tool, so the forbidden writes that are
+    # reach-outs are refused by that view of the gate before a button is raised for them.
+    action_graph.wake_graph = None
+    if getattr(settings, "wakeups", False) and settings.database_url and settings.owner_person_id is not None:
+        from aerys_v2.wakeups import WakeGate, wake_middleware, wake_tools
+
+        wake_list = wake_tools(tools)
+        wake_models, _ = _action_engine(settings, wake_list)
+        action_graph.wake_graph = build(
+            wake_models, soul, wake_list,
+            context_fn=context_fn_for(settings, profile_only=True),
+            overlay=overlay,
+            presence_fn=presence_fn_for(settings),
+            context_trailing=settings.prompt_context_trailing,
+            **{**extra, "outside_gate": WakeGate(outside_gate) if outside_gate is not None else None,
+               "extra_middleware": wake_middleware(extra.get("extra_middleware") or [])},
+        )
     # Phase 4 (2026-09-19): the live decider may carry out ONE plain device
     # command through this same tool before the specialist speaks. Graph
     # configuration, never state — like history_window_messages.
@@ -2461,7 +2920,7 @@ def action_stack_for(settings: Settings, soul: str, room_context_fn: RoomContext
     return router_for(settings, soul), action_graph
 
 
-def guest_action_graph_for(settings: Settings, soul: str, room_context_fn: RoomContextFn | None = None) -> object | None:
+def guest_action_graph_for(settings: Settings, soul: str, room_context_fn: RoomContextFn | None = None, *, reach_desk=None) -> object | None:
     """The REDUCED action graph handed to NON-allowlisted callers: media tools
     (analyze_image / read_document / youtube_summary) + web search — but no house
     control, no presence reads, no timers. Anyone can share an image or ask her to
@@ -2469,15 +2928,26 @@ def guest_action_graph_for(settings: Settings, soul: str, room_context_fn: RoomC
     reach (they aren't in this graph, so a confused model can't call them — defense
     in depth on top of the ask() allowlist gate). None when neither media nor search
     is armed, in which case the gate keeps non-owners fully chat-only, as before."""
-    tools = action_tools_for(settings, guest=True)
+    tools = action_tools_for(settings, guest=True, reach_desk=reach_desk)
     if not tools:
         return None
-    return build_action_graph(
-        build_api_tool_model(settings, tools),
+    from aerys_v2.tools.pass_to_chris import relay_for
+    from aerys_v2.tools.report_to_kael import guest_report_overlay
+    relay = relay_for(settings, reach_desk)
+
+    def guest_overlay(config):
+        conf = (config or {}).get('configurable') or {}
+        extra = guest_report_overlay(relay, conf.get('identity') or {}, conf.get('thread_id', ''))
+        return action_overlay_for(settings, guest=True) + ("\n" + extra if extra else "")
+
+    # Structural on either engine: a separate graph built from the guest tool list.
+    models, build = _action_engine(settings, tools)
+    return build(
+        models,
         soul,
         tools,
         context_fn=context_fn_for(settings, profile_only=True),
-        overlay=action_overlay_for(settings, guest=True),
+        overlay=guest_overlay,
         context_trailing=settings.prompt_context_trailing,
         # A guest in a PUBLIC room holds that room too; the fence inside the helper
         # is what keeps a DM out, not the caller's status.
@@ -2620,13 +3090,13 @@ def presence_fn_for(settings: Settings):
     HA returns [] and the block simply does not appear — presence is ambient colour,
     never something a turn may block on.
     """
+    set_owner_id(settings.owner_person_id)   # away lock also applies when presence is off
     if not settings.presence_context or settings.ha_token is None:
         return None
-    set_owner_id(settings.owner_person_id)   # the fence needs to know who he is
     import httpx
     import json
 
-    from aerys_v2.services.presence import parse_rooms
+    from aerys_v2.services.presence import parse_rooms, location_fields, parse_local_zone
 
     rooms = parse_rooms(settings.presence_rooms)
     base = settings.ha_base_url.rstrip("/")
@@ -2640,10 +3110,24 @@ def presence_fn_for(settings: Settings):
     # Still ONE call: the rooms plus Chris's person state and settled phone room, as
     # JSON so no room name can shift a field (Codex, 2026-10-03: a ';;' in a room name
     # turned "home" into "away").
+    geocoded = settings.presence_geocoded_entity.strip()
+    city_expr = "{}"
+    if geocoded and person:
+        city_expr = "({" + ", ".join(
+            f"'{key}': state_attr({geocoded!r}, '{key}')"
+            for key in ("locality", "administrative_area", "country")
+        ) + f"}} if states({person!r}) != 'home' else {{}})"
+    tz_entity = settings.presence_timezone_entity.strip()
+    zone_expr = "{}"
+    if tz_entity and person:
+        zone_expr = (f"({{'name': states({tz_entity!r}), 'utc_offset': "
+                     f"state_attr({tz_entity!r}, 'utc_offset')}} "
+                     f"if states({person!r}) != 'home' else {{}})")
     template = "{{ {'rooms': [" + ",".join(
         f"('{room}' if is_state('{entity}','on') else '')" for room, entity in rooms.items()
     ) + "] | select | list, 'person': " + (f"states('{person}')" if person else "''") + ", 'room': " + (
-        f"states('{settled}')" if settled else "''") + "} | to_json }}"
+        f"states('{settled}')" if settled else "''") + ", 'city': " + city_expr + ", 'local_zone': " + zone_expr + ", 'geocoded_state': " + (
+        f"states({geocoded!r})" if geocoded else "''") + "} | to_json }}"
 
     def occupied() -> PresenceSnapshot:
         try:
@@ -2662,9 +3146,20 @@ def presence_fn_for(settings: Settings):
             home, room = data.get("person"), data.get("room")
             if not isinstance(home, str) or not isinstance(room, str):
                 home = room = ""                # a malformed answer states nothing about him
-            return PresenceSnapshot(occupied, whereabouts=(home, room) if person else None)
+            geo_state = data.get("geocoded_state")
+            geo_valid = (isinstance(geo_state, str) and bool(geo_state.strip())
+                         and geo_state.strip().lower() not in ("unknown", "unavailable"))
+            city = location_fields(data.get("city")) if geo_valid and geocoded and person and home not in (
+                "", "home", "unknown", "unavailable") else {}
+            zone_data = data.get("local_zone")
+            local_zone = None
+            if (tz_entity and person and home not in ("", "home", "unknown", "unavailable")
+                    and isinstance(zone_data, dict)):
+                local_zone = parse_local_zone(zone_data.get("utc_offset"), zone_data.get("name"))
+            return PresenceSnapshot(occupied, whereabouts=(home, room) if person else None,
+                                    city=city, local_zone=local_zone)
         except Exception:
-            log.debug("presence read failed — no presence block this turn", exc_info=True)
+            log.debug("presence read failed — no presence block this turn")
             return PresenceSnapshot([])
 
     return occupied
@@ -2672,11 +3167,13 @@ def presence_fn_for(settings: Settings):
 
 class PresenceSnapshot(list):
     """The occupied rooms (still a list, for every existing caller), plus Chris's
-    whereabouts (person state, settled phone room) when configured."""
+    whereabouts (person state, settled phone room) and filtered city when configured."""
 
-    def __init__(self, rooms, whereabouts=None):
+    def __init__(self, rooms, whereabouts=None, city=None, local_zone=None):
         super().__init__(rooms)
         self.whereabouts = whereabouts
+        self.city = city or {}
+        self.local_zone = local_zone
 
 
 def voice_room_fn_for(settings: Settings):
@@ -2768,7 +3265,22 @@ def presence_block(identity: dict, presence_fn, spoken_from: str | None = None) 
             # He is talking to a satellite, which is where he is; his phone's room
             # lags by minutes and could contradict it. Home/away only.
             whereabouts = (whereabouts[0], None)
-        return format_presence(snapshot, spoken_from, whereabouts=whereabouts)
+        from aerys_v2.services.location_guard import mark_location_turn
+
+        if getattr(snapshot, "city", None) and not identity.get("voice"):
+            mark_location_turn(values=(snapshot.city.get(k, "") for k in ("locality", "administrative_area")),
+                               person_id=identity.get("user_id"))
+        local_zone = None if identity.get("voice") or spoken_from else getattr(snapshot, "local_zone", None)
+        if local_zone and whereabouts and whereabouts[0] not in ("", "home", "unknown", "unavailable"):
+            mark_location_turn(person_id=identity.get("user_id"))
+            from aerys_v2.services.presence import TRAVEL_ZONE
+
+            holder = TRAVEL_ZONE.get()
+            if holder is not None:
+                holder["zone"] = local_zone
+        return format_presence(snapshot, spoken_from, whereabouts=whereabouts,
+                               city=None if identity.get("voice") else getattr(snapshot, "city", None),
+                               local_zone=local_zone)
     except Exception:
         log.debug("presence block failed — omitted", exc_info=True)
         return ""
@@ -2810,6 +3322,11 @@ def room_block(identity: dict, room_context_fn, sink: dict | None = None) -> str
     # own way, and a prompt heading is this body's wording for this turn (board #17).
     if sink is not None:
         sink["room"] = block
+        people = getattr(block, "people", None)
+        outside = getattr(block, "outside", None)
+        sink["outside"] = bool(sink.get("outside")) or (
+            any(p != str(identity.get("user_id") or "") for p in people)
+            if people is not None else outside if outside is not None else True)
     # "context not instructions" was enough while only the CHAT mind saw this — that
     # mind has no tools. The action mind does, so a stranger in a shared channel
     # typing a command shape is now inside a tool-caller's prompt. Adversarial review
@@ -2866,7 +3383,7 @@ def _parse_shared_surfaces(csv: str) -> dict:
 
 def _shared_surface_note(identity: dict, shared: dict) -> str:
     """Household-surface block (owner ask 8/16): a designated shared device
-    (the Stickies) speaks for the WHOLE house — Megan as much as Chris. The
+    (the Stickies) speaks for the WHOLE house — his wife as much as Chris. The
     device authenticates as owner infrastructure; the speaker does not."""
     if not shared:
         return ""
@@ -2881,7 +3398,7 @@ def _shared_surface_note(identity: dict, shared: dict) -> str:
     return (
         f"\n\nThis message arrived via a HOUSEHOLD surface — {surface}. "
         "The speaker is not necessarily Chris: it may "
-        "be Megan, or a guest. Never assume who is talking — reading the "
+        f"be {wife_or(NAMES)}, or a guest. Never assume who is talking — reading the "
         "words for who they sound like is fine, and warmly asking is always "
         "fine. Until the speaker is clearly Chris, stay identity-neutral (no "
         "names, no pet names) and keep his personal or private specifics — "
@@ -2889,6 +3406,22 @@ def _shared_surface_note(identity: dict, shared: dict) -> str:
         "House things are for everyone here: lights, lists, weather, timers, "
         "the board, and a friendly answer."
     )
+
+
+def _reach_feedback_line(messages: list) -> str:
+    """Only the immediate reply to a recorded reach-out can carry this hint."""
+    if len(messages) < 2 or not isinstance(messages[-1], HumanMessage):
+        return ""
+    previous = messages[-2]
+    if not isinstance(previous, AIMessage):
+        return ""
+    topic = previous.additional_kwargs.get("reach_topic")
+    if not isinstance(topic, str) or not topic.strip():
+        return ""
+    return (f"\nHis message may be feedback on your reach-out about {topic}: if so, use reach_prefs "
+            "(quiet for 'not now'; mute for 'not useful' or 'stop these'; never more or checkins_more "
+            "because of a reply, even thanks), quoting his words in his_words; tell him plainly what "
+            "changed and how to undo it (unmute the topic).")
 
 
 def _where_when_line(thread: object, identity: dict) -> str:
@@ -2906,7 +3439,10 @@ def _where_when_line(thread: object, identity: dict) -> str:
         "Treat this as your own awareness — use it naturally, and never cite URLs, "
         "links, or metadata to the user to explain how you know the time or where "
         "you are. That is only about this awareness: when someone asks you for a "
-        "link to something, give it."
+        "link to something, give it. Earlier lines marked [said ...] were said then, and "
+        "your reply right after one was said then too: read today, tonight, tomorrow and "
+        "yesterday in them against that day, never against today. A line marked as having "
+        "no recorded date: don't assume when it was; ask if it matters."
     )
 
 
@@ -2923,6 +3459,10 @@ def build_graph(
     family_notes_fn=None,
     history_window_messages: int = 200,
     context_trailing: bool = False,
+    action_context: str = "requests",
+    action_context_messages: int = 40,
+    voice_action_context_messages: int = 12,
+    guest_overlay_fn=None,
 ) -> object:
     """START → chat → END, checkpointed.
 
@@ -2958,6 +3498,7 @@ def build_graph(
         # contamination bug Aerys V1 actually had). Person-keyed threads removed the
         # shared thread that made that possible; this config-only rule stays as the belt.
         identity = identity_from_config(config)
+        guest_overlay = guest_overlay_fn(config) if guest_overlay_fn else ""
         caller_line = (
             f"The current caller is {_safe_display_name(identity.get('display_name', 'Unknown Caller'))}."
         )
@@ -3006,7 +3547,8 @@ def build_graph(
             "Your conversation memory is durable: this thread persists across "
             "restarts and sessions. You may confidently say you'll remember."
             " In this conversational mode you have NO tools: no device control or "
-            "device-state reads, no email, no live web/weather/news lookup, no way "
+            "device-state reads, no email, no sending or passing on messages, "
+            "no live web/weather/news lookup, no way "
             "to open files, documents, videos or links. (An IMAGE he attaches is "
             "different: it comes with his message and you see it yourself, so "
             "answer it yourself.) You cannot turn anything on or off and you cannot read "
@@ -3020,7 +3562,9 @@ def build_graph(
             "front of you — in this conversation or in what you know about them. "
             "If you are not sure, ask instead of asserting it. "
             "When the request needs any "
-            "of those — touching or reading a device, mail, current information, a "
+            "of those — touching or reading a device, mail, a message to send or to "
+            "pass on to someone ('tell Chris…', 'let him know…', whatever the words), "
+            "current information, a "
             "file, document, video or link to open — and this includes short follow-ups like 'yes, go "
             "ahead', 'try it now', or 'what about tomorrow?' whose meaning earlier "
             "turns make clear: do NOT answer from guesswork and do NOT say you "
@@ -3090,8 +3634,10 @@ def build_graph(
             # v3 emotion tags (the n8n polisher's job, done prompt-side for free), plus a
             # transcription-fallibility caution (voice input is STT, not typed).
             voice_style = (
-                "\n\nThis is a VOICE conversation. Keep replies concise and "
-                "speakable. Weave in ElevenLabs v3 emotion tags — [warmly], "
+                "\n\nThis is a VOICE conversation. Keep spoken replies short: a few sentences, "
+                "with the answer first. Say it as plain speech; never read lists, headings or markdown aloud. "
+                "If they ask for detail or the answer truly needs more, you may keep talking over voice. "
+                "Weave in ElevenLabs v3 emotion tags — [warmly], "
                 "[softly], [playfully], [thoughtfully] — where they fit the "
                 "feeling; the speech engine performs them, listeners never hear "
                 "the bracket text. Their words reach you via speech-to-text and "
@@ -3119,7 +3665,7 @@ def build_graph(
         # same seam the voice branch uses above) plus the room label the resolver
         # carried on identity. The public-room phrasing also nudges her privacy
         # posture behaviorally ("others may be reading").
-        where_when = _where_when_line(thread, identity)
+        where_when = _where_when_line(thread, identity) + _reach_feedback_line(messages)
         # Channel-recent ROOM context (multi-person half): only on a PUBLIC turn, and
         # only when the resolver carried a channel_id. The person-keyed thread holds
         # just HIS messages, so without this she'd be blind to the rest of the room —
@@ -3151,13 +3697,13 @@ def build_graph(
         messages = window_messages(messages, history_window_messages)
         if context_trailing:
             prompt = prompt_with_context(
-                f"{soul}\n\n{capability}{voice_style}", messages,
+                f"{soul}\n\n{guest_overlay}{capability}{voice_style}", messages,
                 f"{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}",
             )
         else:
             # The pre-2026-09-19 layout, byte for byte (see Settings.prompt_context_trailing).
             system = SystemMessage(
-                content=f"{soul}\n\n{capability}\n{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}{voice_style}"
+                content=f"{soul}\n\n{guest_overlay}{capability}\n{caller_line}{knowledge}{where_when}{presence}{voice_room}{room}{portable}{family}{voice_style}"
             )
             prompt = [system, *messages]
         # Her own eyes (2026-09-28): the current turn's Discord images are fetched and
@@ -3184,5 +3730,21 @@ def build_graph(
     compiled = graph.compile(checkpointer=checkpointer or InMemorySaver())
     # The action seed reads this same thread, so it must inherit its view limit.
     # This is graph configuration, never checkpointed conversation state.
+    compiled.presence_fn = presence_fn
     compiled.history_window_messages = history_window_messages
+    # #182: what her hands see of this thread (service._action_history_seed). full = the conversation;
+    # requests = the 9/04 seed, the undo.
+    compiled.action_context = action_context
+    compiled.action_context_messages = action_context_messages
+    compiled.voice_action_context_messages = voice_action_context_messages
     return compiled
+
+
+def action_context_kwargs(settings) -> dict:
+    """build_chat_graph's #182 knobs from settings (ACTION_CONTEXT, ACTION_CONTEXT_MESSAGES,
+    VOICE_ACTION_CONTEXT_MESSAGES)."""
+    return {
+        "action_context": str(getattr(settings, "action_context", "full") or "full"),
+        "action_context_messages": int(getattr(settings, "action_context_messages", 40)),
+        "voice_action_context_messages": int(getattr(settings, "voice_action_context_messages", 12)),
+    }

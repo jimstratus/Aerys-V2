@@ -56,7 +56,7 @@ def test_absent_evidence_is_a_SKIP_not_a_PASS():
 # ── the six ────────────────────────────────────────────────────────────────
 
 def test_a_public_turn_missing_its_room_fails():
-    good = {'id': 1, 'channel': 'guild', 'room_context': 'Stratus: hi', 'emitted_reply': 'ok'}
+    good = {'id': 1, 'channel': 'guild', 'room_context': 'Quinn: hi', 'emitted_reply': 'ok'}
     bad = {'id': 2, 'channel': 'guild', 'room_context': None, 'emitted_reply': 'ok'}
     assert signals.room_on_public_turns(rows(good)).status == signals.PASS
     failure = signals.room_on_public_turns(rows(good, bad))
@@ -128,9 +128,9 @@ def test_the_report_names_what_broke_and_what_was_checked():
 class FakeConn:
     """Answers by which SQL it was handed. No network, no server, no writes."""
 
-    def __init__(self, turns=(), held=(), memories=(), newest=None, visible=()):
+    def __init__(self, turns=(), held=(), memories=(), newest=None, visible=(), followups=()):
         self.turns, self.held, self.memories = turns, held, memories
-        self.newest, self.visible = newest, visible
+        self.newest, self.visible, self.followups = newest, visible, followups
         self.statements = []
 
     def execute(self, sql, params=None):
@@ -141,6 +141,8 @@ class FakeConn:
                      t.get('created_at')) for t in self.turns]
         elif 'portable_held' in sql:
             rows = [(h['id'], h['reason']) for h in self.held]
+        elif 'v2_reachouts' in sql:
+            rows = [(f['id'], f['headline'], f['created_at']) for f in self.followups]
         elif 'FROM memories' in sql:
             rows = [(m['id'], m['length']) for m in self.memories]
         elif 'ORDER BY created_at DESC LIMIT 1' in sql:
@@ -316,7 +318,7 @@ def test_answers_not_relays_catches_the_nine_twenty_eight_courier_replies():
 def test_answers_not_relays_passes_a_real_answer_and_an_asked_for_relay():
     from aerys_v2.workers.signals import answers_not_relays
     turns = [
-        dict(id=4, channel='dm', input_text='[a photo] look what Megan made',
+        dict(id=4, channel='dm', input_text='[a photo] look what Robin made',
              emitted_reply="Oh, she made that? The glaze on the rim is gorgeous."),
         dict(id=5, channel='dm', input_text='tell Kael the deploy is done',
              emitted_reply="Want me to pass that to Kael now, or hold it for his next check-in?"),
@@ -333,7 +335,7 @@ def test_her_offer_to_file_her_own_report_is_not_a_courier_slip():
     turns = [
         dict(id=7, channel='portable', input_text='why arent you checking long term if the attic doesnt have what you need?',
              emitted_reply='I can add this to the gap report for Kael: a tool to search long-term memory by keyword. Want me to send that?'),
-        dict(id=8, channel='portable', input_text='i just told him about it. For the record, Megan is my wife',
+        dict(id=8, channel='portable', input_text='i just told him about it. For the record, Robin is my wife',
              emitted_reply='Got it. Want me to send Kael the gap report about a keyword search for long-term memory?'),
     ]
     result = answers_not_relays(turns)
@@ -355,3 +357,75 @@ def test_a_hold_nobody_reviewed_for_a_day_fails():
     assert stale.failed and 'b (judge:unclear)' in stale.detail and 'over 24 h' in stale.detail
     assert signals.held_review_is_current([], now=now).status == signals.SKIP
     assert signals.held_review_is_current([undated], now=now).status == signals.SKIP
+
+
+def test_a_test_body_memory_held_at_the_door_is_expected_and_never_overdue():
+    """11/09: the door now HOLDS a test body's memory events (Kael's gate body, the home body's test
+    jobs) instead of admitting them as Chris's. They are test traffic held for an optional look, so
+    neither check may flag them: one as an unexpected hold, the other as a review that's overdue."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)
+    reason = "test body: ember is in PORTABLE_TEST_BODIES; its memories are test traffic, never admitted as the owner's"
+    held = [{'id': 't1', 'reason': reason, 'observed_at': (now - timedelta(days=3)).isoformat()}]
+    assert signals.quarantine_not_noisy(held).status == signals.PASS
+    assert not signals.held_review_is_current(held, now=now).failed
+    owed = [{'id': 'j1', 'reason': 'judge:unclear', 'observed_at': (now - timedelta(days=3)).isoformat()}]
+    assert signals.held_review_is_current(owed + held, now=now).failed      # a real hold still nags
+
+
+def test_her_offer_to_file_her_own_ticket_is_not_a_courier_slip():
+    """11/17 17:18 and 17:41: she offered to send Kael her own problem as a ticket, twice, and the
+    check read both as carrying his words. A ticket to Kael is her own report, like a gap report."""
+    from aerys_v2.workers.signals import answers_not_relays
+    turns = [
+        dict(id=9, channel='discord_dm', input_text='how did you send it to Kael?',
+             emitted_reply="I can't confirm it reached Kael. I can send Kael the WebGL problem now, so it's a "
+                           "tracked ticket. Want me to send it?"),
+        dict(id=10, channel='discord_dm', input_text='no uh its because you handed me the session',
+             emitted_reply='That corrects my read. Want me to send Kael this as a new ticket?'),
+    ]
+    result = answers_not_relays(turns)
+    assert not result.failed and result.checked == 2
+    carried = [dict(id=11, channel='discord_dm', input_text='she wrote back: see you soon',
+                    emitted_reply='Want me to pass that along to Kael?')]
+    assert answers_not_relays(carried).failed, 'carrying someone else\'s words still fails'
+
+
+
+def test_her_offer_to_send_kael_a_summary_of_her_own_work_is_not_a_courier_slip():
+    """11/18 19:04 and 19:06 (turns 3425, 3427): he asked how her audio research reached Kael, and she
+    offered to send Kael a short summary of it. That is her own work, like her report or ticket, not
+    anyone's words carried; the check read both as courier slips."""
+    from aerys_v2.workers.signals import answers_not_relays
+    turns = [
+        dict(id=3425, channel='discord_dm', input_text='Also how did you send the audio stuff to kael?',
+             emitted_reply="I didn't send the audio research to Kael. If you want him to have it, I can send him a "
+                           "short summary. Do you want me to send that, or would you rather hand him the file?"),
+        dict(id=3427, channel='discord_dm', input_text='Not the research helper issue. I meant the whole audio research you did?',
+             emitted_reply="I haven't sent him the report or a summary of it. Do you want me to send him a short "
+                           "summary with the file path?"),
+    ]
+    result = answers_not_relays(turns)
+    assert not result.failed and result.checked == 2, result
+    carried = [dict(id=12, channel='discord_dm', input_text='my friend said dinner is at six',
+                    emitted_reply='Want me to pass that along to Kael?')]
+    assert answers_not_relays(carried).failed, "carrying someone else's words still fails"
+    his_state = [dict(id=13, channel='discord_dm', input_text='ugh this is so frustrating',
+                      emitted_reply='You seem frustrated. Want me to send Kael a quick summary?')]
+    assert answers_not_relays(his_state).failed, 'a bare summary of HIM is still a courier slip (Gemini 11/19)'
+
+
+def test_a_held_follow_up_after_a_kael_note_is_reported_with_its_words():
+    """D70 (his 17:45): nothing held silently. Each held follow-up gets a human look: a false hold
+    silences her, which is the one-way feeling he named on 11/07."""
+    from datetime import datetime, timezone
+    when = datetime(2026, 11, 18, 23, 5, tzinfo=timezone.utc)
+    conn = FakeConn(followups=[{'id': 7, 'headline': "I'll check it tomorrow, Chris.", 'created_at': when},
+                               {'id': 9, 'headline': "I've withdrawn the request.", 'created_at': when}])
+    result = signals.note_followups_held(conn.execute(signals.HELD_FOLLOWUPS_SQL, {'window': '26 hours'}).fetchall())
+    assert result.failed and result.checked == 2
+    assert "2 follow-up" in result.detail and "withdrawn the request" in result.detail
+    quiet = signals.note_followups_held([])
+    assert not quiet.failed
+    run = signals.run_signals(turns_conn=conn, memories_conn=conn, person_id='p1', aliases=['Sira'])
+    assert any(r.name == 'note_followups_held' and r.failed for r in run)

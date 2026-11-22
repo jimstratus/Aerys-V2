@@ -15,15 +15,97 @@ on a daemon thread; every failure is a debug log — a dark desk speaker costs n
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 import threading
+import time
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
 #: emotion tags for ElevenLabs v3 stay in (her pipeline voice reads them); markdown
 #: does not — asterisks and backticks have no business in speech
 _MARKDOWN = re.compile(r"(\*\*|__|`+|^#+\s*)", re.M)
+
+#: Chris 11/13 (the office button, "she shuts up"): a hush ends everything she was going to say there
+#: for the turns that began before it: the clip playing, what's queued, a clip still being made, a
+#: research answer still coming, a mic reopen. A turn notes when it began (turn_started, carried to its
+#: background follow-up through the copied context); every clip carries that time ("since"), and the
+#: speaker itself refuses a clip from before its last hush ("hush_at" on /stop). The speaker is the
+#: judge, so no race between connections can let a hushed clip through, and a newer clip is never
+#: stopped by an older one. Speech that belongs to no turn (the reach desk) is "since now": it plays.
+#: Wall-clock seconds from this brain on both sides, so a restart doesn't reset anything.
+_HUSH_AT: dict[str, float] = {}
+_HUSH_LOCK = threading.Lock()
+_TURN: contextvars.ContextVar[float | None] = contextvars.ContextVar("speaker_turn", default=None)
+
+
+def hush(device_id: str | None, at: float | None = None) -> float:
+    """Hush this speaker as of now, or as of an earlier moment (at: when a satellite heard the stop,
+    so a turn he began after it is never held); returns the time, for the speaker's own floor."""
+    now = time.time() if at is None else min(time.time(), at)
+    if device_id:
+        with _HUSH_LOCK:
+            _HUSH_AT[str(device_id)] = max(_HUSH_AT.get(str(device_id), 0.0), now)
+    return now
+
+
+def hushed_at(device_id: str | None) -> float:
+    with _HUSH_LOCK:
+        return _HUSH_AT.get(str(device_id or ""), 0.0)
+
+
+#: when the latest voice turn began on each device (11/14: a satellite's second stop must spare his new ask).
+#: Bounded: any authed /ask may name a device (Codex 11/14).
+_TURN_AT: dict[str, float] = {}
+TURN_AT_MAX = 256
+
+
+def turn_started(device_id: str | None = None) -> None:
+    """A voice turn began now: whatever it says later, on any speaker, is from this turn."""
+    now = time.time()
+    _TURN.set(now)
+    if device_id:
+        with _HUSH_LOCK:
+            _TURN_AT[str(device_id)] = now
+            if len(_TURN_AT) > TURN_AT_MAX:
+                del _TURN_AT[min(_TURN_AT, key=_TURN_AT.get)]
+
+
+def last_turn(device_id: str | None) -> float:
+    with _HUSH_LOCK:
+        return _TURN_AT.get(str(device_id or ""), 0.0)
+
+
+def _since() -> float:
+    turn = _TURN.get()
+    return turn if turn is not None else time.time()
+
+
+def held(device_id: str | None) -> bool:
+    """Was this speaker hushed after the current turn began? (11/14: the satellite path asks too.)"""
+    return hushed_at(device_id) > _since()
+
+
+#: 11/13: what she said lately on each speaker, shared by every redirect in this process (the /ask door
+#: and the follow-up router), so the door can tell her own voice coming back through the mic from his.
+RECENT_SAID_S = 180
+_SAID: dict[str, list[tuple[float, str]]] = {}
+
+
+def note_said(device_id: str | None, text: str) -> None:
+    if device_id and text:
+        now = time.time()
+        with _HUSH_LOCK:
+            kept = [(t, s) for t, s in _SAID.get(str(device_id), []) if now - t < RECENT_SAID_S]
+            _SAID[str(device_id)] = [*kept[-5:], (now, text)]
+
+
+def recent_said(device_id: str | None) -> str:
+    now = time.time()
+    with _HUSH_LOCK:
+        return " ".join(s for t, s in _SAID.get(str(device_id or ""), []) if now - t < RECENT_SAID_S)
 
 
 def parse_targets(raw: str) -> dict[str, str]:
@@ -52,15 +134,61 @@ class SpeakerRedirect:
     def handles(self, device_id: str | None) -> bool:
         return bool(device_id) and device_id in self._targets
 
-    def say(self, device_id: str | None, text: str) -> None:
+    def quick_playing(self, device_id: str | None) -> bool:
+        """playing(), asked with a short timeout: the door asks on every turn from a redirected speaker,
+        and a speaker that doesn't answer must not hold his turn up (Codex 11/13)."""
+        return self.playing(device_id, timeout=0.4)
+
+    def playing(self, device_id: str | None, timeout: float = 1.5) -> bool:
+        """Best-effort: is she talking there, a clip playing or more queued behind it? Failures read
+        as not talking (harmless). 11/13: "On it." queued behind a long answer is still her talking."""
+        if not self.handles(device_id):
+            return False
+        try:
+            response = self._client.get(
+                f"{self._targets[device_id]}/health",
+                headers=self._speaker_headers, timeout=timeout,
+            )
+            response.raise_for_status()
+            health = response.json()
+            return health.get("playing") is True or int(health.get("queued") or 0) > 0
+        except Exception:
+            log.debug("speaker redirect playing failed (harmless)", exc_info=True)
+            return False
+
+    def stop(self, device_id: str | None, hush_at: float | None = None) -> bool:
+        """Best-effort speaker stop; failures are harmless. With hush_at the speaker also refuses
+        every later clip from a turn that began before it."""
+        if not self.handles(device_id):
+            return False
+        try:
+            response = self._client.post(
+                f"{self._targets[device_id]}/stop",
+                headers=self._speaker_headers, timeout=3.0,
+                json={"hush_at": hush_at} if hush_at is not None else {},
+            )
+            response.raise_for_status()
+            return response.json().get("stopped") is True
+        except Exception:
+            log.debug("speaker redirect stop failed (harmless)", exc_info=True)
+            return False
+
+    def say(self, device_id: str | None, text: str, *, then: Callable[[], None] | None = None) -> None:
         if not self.handles(device_id) or not (text or "").strip():
             return
+        since = _since()
+        if hushed_at(device_id) > since:
+            log.info("speaker redirect: hushed on %s since this turn began; not saying it", device_id)
+            return
+        note_said(device_id, text)
         if self._async:
-            threading.Thread(target=self._say, args=(device_id, text), daemon=True).start()
+            threading.Thread(target=self._say, args=(device_id, text, then, since), daemon=True).start()
         else:
-            self._say(device_id, text)
+            self._say(device_id, text, then, since)
 
-    def _say(self, device_id: str, text: str) -> None:
+    def _say(self, device_id: str, text: str, then: Callable[[], None] | None = None,
+             since: float | None = None) -> None:
+        since = time.time() if since is None else since
         try:
             r = self._client.post(
                 f"{self._ha}/api/tts_get_url",
@@ -70,9 +198,14 @@ class SpeakerRedirect:
             )
             r.raise_for_status()
             url = r.json()["url"]
+            if hushed_at(device_id) > since:
+                return                       # hushed while it was being made: it never plays
             p = self._client.post(f"{self._targets[device_id]}/play", headers=self._speaker_headers,
-                                  json={"url": url}, timeout=5.0)
+                                  json={"url": url, "since": since, **({"wait": True} if then is not None else {})},
+                                  timeout=130.0 if then is not None else 5.0)
             p.raise_for_status()
+            if then is not None and p.json().get("played") is True:
+                then()
         except Exception:
             log.debug("speaker redirect failed (harmless)", exc_info=True)
 

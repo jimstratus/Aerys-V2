@@ -34,13 +34,25 @@ class _LiveRoom:
 
 LIVE_ROOM = _LiveRoom()
 
-def test_discord_runner_wires_context_fn(monkeypatch):
+@pytest.mark.parametrize("relay_on", [False, True])
+def test_discord_runner_wires_context_fn(monkeypatch, relay_on):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "dev-bot-token")
     # Keep the run hermetic: no DB (cold resolver), no wrong-database boot trap.
     for stray in ("DATABASE_URL", "MEMORIES_DATABASE_URL", "TELEGRAM_BOT_TOKEN"):
         monkeypatch.delenv(stray, raising=False)
     monkeypatch.setattr(cli, "run_boot_assertions", lambda *a, **k: None)
+
+    monkeypatch.setenv("MESSAGES_AS_HERSELF", str(relay_on).lower())
+    import aerys_v2.kael_line as line
+    import aerys_v2.tools.pass_to_chris as relay
+    desk_calls, guest_calls = [], []
+    monkeypatch.setattr(line, "reach_desk_for", lambda *a: pytest.fail("soak must not build a delivery desk"))
+    monkeypatch.setattr(relay, "relay_queue_for", lambda s: (desk_calls.append(s.messages_as_herself)
+                        or ("QUEUE" if s.messages_as_herself else None)))
+    monkeypatch.setattr(factory, "guest_action_graph_for",
+                        lambda s, soul, **kw: (guest_calls.append(kw) or "GUEST"))
+    monkeypatch.setattr(cli, "_arm_live_reflex", lambda s, r, router, graph: (router, r))
 
     # Factory seams -> sentinels (no models, no checkpointer, no DB).
     monkeypatch.setattr(factory, "build_model", lambda s: "MODEL")
@@ -50,7 +62,7 @@ def test_discord_runner_wires_context_fn(monkeypatch):
     monkeypatch.setattr(factory, "deep_gate_for", lambda s: "DEEPGATE")
     monkeypatch.setattr(factory, "turn_recorder_for", lambda s: "RECORDER")
     monkeypatch.setattr(factory, "action_allowlist_for", lambda s: "ALLOW")
-    monkeypatch.setattr(factory, "action_stack_for", lambda s, soul, **kw: None)  # chat-only
+    monkeypatch.setattr(factory, "action_stack_for", lambda s, soul, **kw: ("ROUTER", "ACTION"))
     # The seam under test: build_graph must receive context_fn_for(settings), the
     # SAME long-term memory wiring --serve has.
     monkeypatch.setattr(factory, "context_fn_for", lambda s: "CTXFN")
@@ -64,14 +76,19 @@ def test_discord_runner_wires_context_fn(monkeypatch):
 
     def fake_build_graph(model, *, soul, checkpointer, context_fn, tier_models,
                          room_context_fn, portable_context_fn, history_window_messages,
-                         context_trailing):
+                         context_trailing, action_context, action_context_messages,
+                         voice_action_context_messages, guest_overlay_fn):
         graph_calls.update(
             model=model, soul=soul, checkpointer=checkpointer,
+            guest_overlay_fn=guest_overlay_fn,
             context_fn=context_fn, tier_models=tier_models,
             room_context_fn=room_context_fn,
             portable_context_fn=portable_context_fn,
             history_window_messages=history_window_messages,
             context_trailing=context_trailing,
+            action_context=action_context,  # #182: what her hands see of the thread
+            action_context_messages=action_context_messages,
+            voice_action_context_messages=voice_action_context_messages,
         )
         return "GRAPH"
 
@@ -100,11 +117,14 @@ def test_discord_runner_wires_context_fn(monkeypatch):
         cli.main()
     assert exc.value.code == 0
 
+    assert desk_calls == [relay_on]
+    assert guest_calls[0]["reach_desk"] == ("QUEUE" if relay_on else None)
     assert len(made) == 1
     assert made[0].run_token == "dev-bot-token"
     # The regression guard: context_fn is threaded from context_fn_for(settings)
     # into build_graph, so Discord text chats recall long-term memory — plus the
     # room-context seam (channel-recent multi-person block) wired the same way.
+    assert graph_calls.pop("guest_overlay_fn")({}) == ""
     assert graph_calls == {
         "model": "MODEL",
         "soul": "SOUL",
@@ -117,4 +137,8 @@ def test_discord_runner_wires_context_fn(monkeypatch):
         "portable_context_fn": "PORTFN",
         "history_window_messages": 17,
         "context_trailing": False,
+        # #182: her hands see the conversation by default (ACTION_CONTEXT=full, 40 / voice 12).
+        "action_context": "full",
+        "action_context_messages": 40,
+        "voice_action_context_messages": 12,
     }

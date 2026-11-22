@@ -34,7 +34,7 @@ from aerys_v2.workers.capability_requests import (
 
 T0 = datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc)
 CHRIS = "6e6bcbed-03ef-4d17-95d2-89c467414335"
-MEGAN = "11111111-2222-3333-4444-555555555555"
+ROBIN = "11111111-2222-3333-4444-555555555555"
 
 
 def _raw(at: datetime) -> str:
@@ -215,6 +215,15 @@ def test_by_design_markers_are_not_gaps():
     # escalation feature working, not degradation — never mined (2026-07-21).
     sigs = classify_turn(turn(degraded=["chat_handoff", "escalated_from_chat"]))
     assert sigs == []
+
+
+def test_receipts_of_the_guard_and_the_voice_carry_are_not_gaps():
+    """11/15 cleanup: untrusted_read (every outside read, D28) and voice_owner_assumed (D43) sat on the gaps
+    board as 'degraded subsystem' rows (#154 x25, #155 x9). They are the features working."""
+    from aerys_v2.state import VOICE_OWNER_ASSUMED_MARKER
+    assert classify_turn(turn(degraded=["untrusted_read", VOICE_OWNER_ASSUMED_MARKER])) == []
+    sigs = classify_turn(turn(degraded=["untrusted_read", "outside_guard_failed"]))
+    assert [s.fingerprint for s in sigs] == ["degraded::outside_guard_failed"]
 
 
 def test_by_design_marker_beside_a_real_one_only_drops_itself():
@@ -429,8 +438,8 @@ def test_autocommit_connection_refuses_before_any_write():
 
 def test_owner_filter_scopes_the_fetch():
     conn = GapConn(turns=[])
-    run_gap_mining(conn, allowlist={CHRIS, MEGAN})
-    assert conn.miner_params["person_ids"] == sorted([CHRIS, MEGAN])
+    run_gap_mining(conn, allowlist={CHRIS, ROBIN})
+    assert conn.miner_params["person_ids"] == sorted([CHRIS, ROBIN])
 
 
 def test_empty_window_is_a_noop():

@@ -341,6 +341,118 @@ def test_voice_action_human_turn_lands_at_ack_time():
 # that claim into a real action instead of a scolding.
 
 
+# ---- D61 THE PROMISE GATE (Chris 11/18 10:16, "1. a"; ticket T-25) ------------------------
+# 09:43: "did you wanna do wordle while we wait" was routed to chat; she said "Sure, I'll play
+# today's Wordle..." holding no tools, and nothing ran. A promise like that escalates too.
+
+
+def test_promise_gate_escalates_the_wordle_promise():
+    graph = build_graph(fake_model("Sure, Chris. I'll play today's Wordle on my home machine."), soul="s")
+    stub = SeedCapturingActionGraph("Started: today's Wordle is running on my home machine.")
+    out = ask(graph, "did you wanna do wordle while we wait", identity=CHRIS, thread_id="t-promise",
+              router=chat_router, action_graph=stub)
+    assert out == "Started: today's Wordle is running on my home machine."
+    contents = [m.content for m in graph.get_state({"configurable": {"thread_id": "t-promise"}}).values["messages"]]
+    assert contents == ["did you wanna do wordle while we wait",
+                        "Started: today's Wordle is running on my home machine."]   # the promise never stays
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("did you wanna do wordle while we wait", "Sure, Chris. I\u2019ll play today\u2019s Wordle now."),  # curly
+    ("Can you check my email?", "Let me check your inbox now."),
+    ("Can you set a reminder for tomorrow?", "I will set the reminder for tomorrow now."),   # the date is the task's
+])
+def test_promise_gate_catches_what_codex_found_slipping(user, reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("Done for real.")
+    assert ask(graph, user, identity=CHRIS, thread_id="t-promise4", router=chat_router,
+               action_graph=stub) == "Done for real."
+
+
+# 11/18 10:47: his "give it a shot" (yes to her own MapTap offer) went to chat; she said "Starting
+# today's MapTap run on my home machine now" holding no tools, and nothing ran for 20 minutes.
+MAPTAP_1047 = ("Starting today's MapTap run on my home machine now, Chris. It'll open the page and take a "
+               "look before any tap, then use browse_pointer to drag the globe and place each guess.")
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("give it a shot", MAPTAP_1047),                                          # the live miss
+    ("go for it", "Kicking off today's MapTap now."),
+    ("yes", "I'm starting the MapTap run on my home machine."),
+    ("sure, do it", "Okay, launching MapTap on my home machine."),
+    ("yeah go ahead", "Sending it to Kael now."),
+    ("ok sure, try it", "Got it. Opening MapTap in my browser now."),
+    # Codex 11/18: the yeses and the progress wording that still slipped
+    ("yes, please", "Starting today's MapTap run now."),
+    ("sure thing", "Starting today's MapTap run now."),
+    ("absolutely", "Starting today's MapTap run now."),
+    ("\U0001f44d", "Starting today's MapTap run now."),
+    ("yes", "I'm now starting MapTap."),
+    ("yes", "I'm just opening MapTap now."),
+    ("yes", "Checking your inbox now."),
+    ("yes", "Turning the lights off now."),
+    ("yes", "Sure thing, launching MapTap now."),
+    ("yes", "Sending to Kael now."),                     # Codex re-check: "to" is not an idiom
+])
+def test_promise_gate_catches_a_yes_answered_with_starting_now(user, reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("Started for real.")
+    assert ask(graph, user, identity=CHRIS, thread_id="t-promise5", router=chat_router,
+               action_graph=stub) == "Started for real."
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("give it a shot", "Starting with a fox: once upon a time, in a forest."),   # a story is talk
+    ("perfect", "Good. I'll keep it that way for every Wordle run."),           # his 10:26 wrap-up
+    ("sweet yeah, like this going forward", "Locked in. Grid first, walkthrough after."),
+    ("yes", "Running low on ideas for the next one, honestly."),
+    ("i told him separately", "Good, then it's covered and I'll leave it alone."),
+    # Codex 11/18: talk that opens with one of those words
+    ("yes", "Playing devil's advocate: waiting seems wiser."),
+    ("yes", "Opening thoughts: this seems sensible."),
+    ("yes", "Running total: three ideas so far."),
+    ("yes", "Starting a new chapter in life can feel scary."),
+    ("yes", "Sending good vibes your way."),
+    ("yes", "Checking my understanding: you prefer blue."),
+    ("yes", "Sharing a thought: this seems sensible."),
+    ("yes", "Turning to your question: it depends."),
+])
+def test_promise_gate_leaves_a_yes_to_talk_alone(user, reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("(must not run)")
+    out = ask(graph, user, identity=CHRIS, thread_id="t-promise6", router=chat_router, action_graph=stub)
+    assert out == reply and stub.seeds == []
+
+
+def test_promise_gate_marks_its_own_audit_row():
+    rec = Recorder()
+    graph = build_graph(fake_model("On it."), soul="s")
+    ask(graph, "can you check on the planner job", identity=CHRIS, thread_id="t-promise2",
+        router=chat_router, action_graph=SeedCapturingActionGraph(), record_turn=rec)
+    action_row = next(r for r in rec.wait(1) if r.get("classifier_intent") == "action")
+    degraded = json.loads(action_row["degraded"])
+    assert "promise_gate_escalated" in degraded and "claim_gate_escalated" not in degraded
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("do you remember when you played wordle?", "I'll play it again sometime, it was fun."),   # reminiscing
+    ("can you start the dishwasher", "I can't start that from here."),                       # honest refusal
+    ("can you tell me a story", "I'll tell you one about a fox."),                           # talk, not a job
+    ("can you send it", "I won't send it until you say so."),                                # negated
+    # Codex 11/18: storytelling, later, and on a condition are not "now"
+    ("Can you tell me a story?", "I'll start with a fox in a forest."),
+    ("Do you want to play Wordle tomorrow?", "I'll play it tomorrow."),
+    ("Can you send it once I approve?", "I'll send it once you approve."),
+    ("can you send it", "Once you approve, I will send it."),                 # Codex re-check: condition first
+    ("can you tell me a story", "I will start the story with a fox."),
+])
+def test_promise_gate_leaves_talk_alone(user, reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("(must not run)")
+    out = ask(graph, user, identity=CHRIS, thread_id="t-promise3", router=chat_router, action_graph=stub)
+    assert out == reply and stub.seeds == []
+
+
 def test_claim_gate_escalates_a_toolless_completion_claim():
     graph = build_graph(fake_model("Got it to Kael — sent."), soul="s")
     stub = SeedCapturingActionGraph("Delivered — Kael has it now.")
@@ -510,3 +622,79 @@ def test_router_hears_garbled_kael_as_an_action(text):
 def test_the_vegetable_is_still_a_vegetable(text):
     from aerys_v2.router import plausibly_messages_kael
     assert plausibly_messages_kael(text) is False
+
+
+# ---- D65 THE STATUS GATE (Chris 11/18 11:38, "yes i'd like for you to do that next") -----------
+# 10:50: "i told him separately" went to chat; she answered "The MapTap run is still going on my home
+# machine" when no job had ever started. A tool-less "it's still going" about a home job is re-sent
+# down the action path, told to look at the job before saying how it's going.
+STILL_GOING_1050 = ("Good, then it's covered and I'll leave it alone. I won't resend anything to Kael. "
+                    "The MapTap run is still going on my home machine.")
+
+
+@pytest.mark.parametrize("reply", [
+    STILL_GOING_1050,                                               # the live miss
+    "The job is still running, I'll tell you when it's done.",
+    "It’s still running on my home machine.",                  # curly
+    "Today's Wordle run is underway.",
+    # Codex 11/18: named jobs, progress words, and a "No worries." sentence before the claim
+    "MapTap is still running.",
+    "The MapTap run is still chugging along.",
+    "No worries. The MapTap run is still going.",
+    # Codex re-check 11/18: punctuation between subject and status, a question after the claim,
+    # plain "is going"/"is working", and an affirmative clause after "but"
+    "The job, as expected, is still running.",
+    "The job status: still running.",
+    "The job is slow but still running.",
+    "The job is still running, would you like an update?",
+    "The job is still running; anything else?",
+    "The job is going.",
+    "The task is working.",
+    "I can't see the page, but the MapTap run is still going.",
+    "Sure, the job is still running.",                              # "sure" is not doubt
+    "It's probably still running on my home machine.",              # hedged, still unchecked
+])
+def test_status_gate_sends_a_still_going_down_the_path_that_can_look(reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("Checked: no home job is running right now.")
+    out = ask(graph, "i told him separately", identity=CHRIS, thread_id="t-status", router=chat_router,
+              action_graph=stub)
+    assert out == "Checked: no home job is running right now."
+    last = stub.seeds[0][-1]
+    assert "i told him separately" in str(last.content) and "check_async_task" in str(last.content)
+    contents = [m.content for m in graph.get_state({"configurable": {"thread_id": "t-status"}}).values["messages"]]
+    assert reply not in contents                                    # the unchecked claim never stays
+
+
+@pytest.mark.parametrize("reply", [
+    "The run finished at 11:30 with 407 points.",
+    "The run isn't still going; it finished at 11:30.",
+    "Your job is still going well, I hope.",                        # his work, not her home job
+    "The dishwasher is still running.",
+    "I'm still running low on ideas.",
+    # Codex 11/18: his work, a condition, a reported question, her own question
+    "Your new job is going well.",
+    "If the job is running, wait for it to finish.",
+    "You asked whether the job is running.",
+    "Is the MapTap run still going?",
+    # Codex re-check 11/18: uncertainty before the status, and "going to"
+    "I cannot confirm whether, at this point, the job is still running.",
+    "I cannot confirm: the job is still running.",
+    "The job is going to take a while to start.",
+])
+def test_status_gate_leaves_other_talk_alone(reply):
+    graph = build_graph(fake_model(reply), soul="s")
+    stub = SeedCapturingActionGraph("(must not run)")
+    out = ask(graph, "how are things", identity=CHRIS, thread_id="t-status2", router=chat_router, action_graph=stub)
+    assert out == reply and stub.seeds == []
+
+
+def test_status_gate_marks_its_own_audit_row():
+    rec = Recorder()
+    graph = build_graph(fake_model("The job is still running."), soul="s")
+    ask(graph, "ok", identity=CHRIS, thread_id="t-status3", router=chat_router,
+        action_graph=SeedCapturingActionGraph(), record_turn=rec)
+    action_row = next(r for r in rec.wait(1) if r.get("classifier_intent") == "action")
+    degraded = json.loads(action_row["degraded"])
+    assert "status_gate_escalated" in degraded
+    assert "promise_gate_escalated" not in degraded and "claim_gate_escalated" not in degraded

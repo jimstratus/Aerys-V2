@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "a2a-sdk[http-server]==1.3.0",
+    "httpx>=0.28.1,<0.29",
     "aiogram>=3.13",
     # Held at the SDK the sticks already run with langchain-anthropic 1.7.x (aerys-portable
     # pins 0.125.0): SDK 1.x+ moves to httpx2, which is a separate, deliberate step.
@@ -40,6 +42,7 @@ dependencies = [
 
 [project.scripts]
 aerys-v2 = "aerys_v2.cli:main"
+aerys-v2-a2a = "aerys_v2.a2a.config:main"
 
 [build-system]
 requires = ["uv_build>=0.11.23,<0.12.0"]
